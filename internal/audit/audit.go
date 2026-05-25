@@ -42,6 +42,7 @@ const (
 	ActionRecordingComplete = "ssh.recording.completed"
 	ActionPortForwardOpened = "ssh.port_forward.opened"
 	ActionPortForwardClosed = "ssh.port_forward.closed"
+	ActionSubsystemOpened   = "ssh.subsystem.opened"
 )
 
 // Sink is the typed JSON-encoding journal sink ssh-proxyd uses to

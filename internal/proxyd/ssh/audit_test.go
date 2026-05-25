@@ -521,6 +521,65 @@ func TestAudit_EmitsPortForwardOpenedAndClosed(t *testing.T) {
 	}
 }
 
+func TestAudit_EmitsSubsystemOpenedForSCPExec(t *testing.T) {
+	// User runs `scp -t /tmp/foo` via an exec request — the proxy
+	// must emit ssh.subsystem.opened with kind=scp and the command
+	// tail in metadata.
+	addr, cap, target, certSigner, cleanup := newAuditTestServer(t)
+	defer cleanup()
+
+	client, err := dialAsUser(addr, "alice@"+target.addr, gossh.PublicKeys(certSigner))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	// fakeTarget's handler accepts any exec; we just need the
+	// request to flow through the proxy.
+	_, _ = sess.Output("scp -t /tmp/foo")
+	_ = client.Close()
+	time.Sleep(80 * time.Millisecond)
+
+	opened := cap.findActions(t, audit.ActionSubsystemOpened)
+	if len(opened) != 1 {
+		t.Fatalf("subsystem.opened entries = %d, want 1", len(opened))
+	}
+	if !strings.Contains(opened[0].Metadata, `"kind":"scp"`) {
+		t.Errorf("Metadata missing kind=scp: %q", opened[0].Metadata)
+	}
+	if !strings.Contains(opened[0].Metadata, "scp -t /tmp/foo") {
+		t.Errorf("Metadata missing command: %q", opened[0].Metadata)
+	}
+	// Tied back to the surrounding session.
+	sessEntries := cap.findActions(t, audit.ActionSessionOpened)
+	if len(sessEntries) == 1 && opened[0].SessionID != sessEntries[0].SessionID {
+		t.Errorf("subsystem.opened.SessionID mismatch with session.opened")
+	}
+}
+
+func TestAudit_NoSubsystemEventForRegularExec(t *testing.T) {
+	// A non-scp exec command must NOT produce a subsystem event —
+	// only the file-transfer set is surfaced.
+	addr, cap, target, certSigner, cleanup := newAuditTestServer(t)
+	defer cleanup()
+
+	client, _ := dialAsUser(addr, "alice@"+target.addr, gossh.PublicKeys(certSigner))
+	defer client.Close()
+	sess, _ := client.NewSession()
+	_, _ = sess.Output("ls -la /tmp")
+	_ = client.Close()
+	time.Sleep(80 * time.Millisecond)
+
+	if got := cap.findActions(t, audit.ActionSubsystemOpened); len(got) != 0 {
+		t.Errorf("subsystem.opened entries = %d, want 0 for regular exec", len(got))
+	}
+}
+
 // itoaPort is a tiny strconv.Itoa replacement so this test file
 // avoids the strconv import for one integer.
 func itoaPort(i int) string {

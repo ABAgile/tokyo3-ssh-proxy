@@ -128,6 +128,7 @@ can be correlated.
 | `recording.completed`  | When a PTY session's asciinema cast file has been finalised.  |
 | `port_forward.opened`  | After a `direct-tcpip` channel is accepted (src/dst host:port).|
 | `port_forward.closed`  | When the `direct-tcpip` channel ends (bytes_in/out, duration). |
+| `subsystem.opened`     | When a session starts SCP (exec `scp …`) or SFTP (subsystem).  |
 
 `recording.completed` carries the absolute cast path and metadata with
 `duration_seconds` and `started_at`. Audit emission is best-effort —

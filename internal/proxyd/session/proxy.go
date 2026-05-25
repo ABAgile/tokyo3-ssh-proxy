@@ -309,6 +309,14 @@ func (p *Proxier) pipeUserRequests(src <-chan *gossh.Request, dst gossh.Channel,
 				}
 			}
 		}
+		// File-transfer subsystem detection: scp launches via "exec"
+		// with a "scp …" command, sftp via the "sftp" subsystem
+		// request. Either kicks an audit event so compliance can
+		// trace which sessions moved bytes. Inner-protocol parsing
+		// (per-file paths, sizes) is a follow-up slice.
+		if kind, cmd, ok := detectSubsystem(req); ok {
+			emitSubsystemOpened(context.Background(), p.auditSink, p.sessionID, p.sessionAttr, kind, cmd, p.log)
+		}
 		ok, err := dst.SendRequest(req.Type, req.WantReply, req.Payload)
 		if err != nil {
 			ok = false
