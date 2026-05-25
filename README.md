@@ -73,6 +73,14 @@ internal/
   validity envelope by default; signing failures retry without
   disrupting sshd, which keeps serving with the existing cert until
   it expires.
+- **Mux is yamux over mTLS.** ssh-tunneld holds an outbound,
+  long-lived mTLS connection to ssh-proxyd, wrapped in a
+  [yamux](https://github.com/hashicorp/yamux) session. Both sides
+  share `internal/common/tunnel` config (15s keepalive, 30s frame
+  timeout, 4 MiB per-stream window) so drift is impossible. The
+  dialer reconnects with exponential backoff (1s → 30s, ±20% jitter)
+  on session loss and surfaces the live session to a caller-supplied
+  `SessionHandler` for stream forwarding.
 
 ## Audit events
 
