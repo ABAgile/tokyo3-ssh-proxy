@@ -41,6 +41,12 @@
 //	                     used to verify target sshd host keys. When
 //	                     unset, target host keys are NOT verified
 //	                     (InsecureIgnoreHostKey) — dev only.
+//
+//	SSH_PROXYD_CAST_DIR  Directory where asciinema cast files are
+//	                     written, one per recorded session. When
+//	                     unset, session recording is disabled — the
+//	                     proxy still forwards traffic but produces
+//	                     no audit cast files.
 package main
 
 import (
@@ -60,6 +66,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
 )
 
@@ -120,6 +127,11 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("target host key callback: %w", err)
 	}
 
+	sink, err := loadRecordingSink(log)
+	if err != nil {
+		return fmt.Errorf("recording sink: %w", err)
+	}
+
 	srv, err := pssh.New(pssh.Config{
 		Addr:                  addr,
 		Log:                   log,
@@ -127,6 +139,7 @@ func runServe(ctx context.Context) error {
 		TrustedUserCA:         userCA,
 		ClientSigner:          clientSigner,
 		TargetHostKeyCallback: hostKeyCB,
+		RecordingSink:         sink,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh server: %w", err)
@@ -233,6 +246,24 @@ func loadSSHPrivateKey(path string) (gossh.Signer, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return signer, nil
+}
+
+// loadRecordingSink returns the asciinema cast sink. When
+// SSH_PROXYD_CAST_DIR is set, recordings drop into that directory
+// via [recording.LocalDirSink]. Unset disables recording with a
+// startup warning.
+func loadRecordingSink(log *slog.Logger) (recording.Sink, error) {
+	dir := os.Getenv("SSH_PROXYD_CAST_DIR")
+	if dir == "" {
+		log.Warn("SSH_PROXYD_CAST_DIR unset — session recording disabled")
+		return nil, nil
+	}
+	sink, err := recording.NewLocalDirSink(dir)
+	if err != nil {
+		return nil, fmt.Errorf("local cast dir: %w", err)
+	}
+	log.Info("session recording enabled", "root", sink.Root())
+	return sink, nil
 }
 
 // loadTargetHostKeyCallback returns the callback used to verify the

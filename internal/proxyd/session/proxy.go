@@ -1,7 +1,9 @@
 package session
 
 import (
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -9,26 +11,45 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 )
 
 // Proxier bridges a user-side SSH connection to a target-side SSH
 // client connection. New inbound channels open a matching outbound
 // channel on the target; data + requests flow bidirectionally.
 // Cert-driven RBAC gates filter the channel and request types the
-// user is allowed to use.
+// user is allowed to use, and PTY traffic is tee'd into an
+// asciinema cast for audit + replay.
 type Proxier struct {
 	target *gossh.Client
 	rbac   *rbac.CertEnforcer
+	sink   recording.Sink // nil disables recording
+	user   string         // cert KeyID, for cast metadata
+	host   string         // target host, for cast metadata
 	log    *slog.Logger
 }
 
-// NewProxier wraps target + cert claims into a [Proxier]. A nil
-// enforcer is treated as fully permissive — useful in tests; the
-// production server always passes a real one.
-func NewProxier(target *gossh.Client, enforcer *rbac.CertEnforcer, log *slog.Logger) *Proxier {
+// Config bundles the optional knobs for [NewProxier]. Required:
+// Target. Sink + User + Host enable session recording; leaving Sink
+// nil disables it.
+type Config struct {
+	Target   *gossh.Client
+	Enforcer *rbac.CertEnforcer
+	Sink     recording.Sink
+	User     string
+	Host     string
+	Log      *slog.Logger
+}
+
+// NewProxier wraps cfg into a [Proxier]. A nil Enforcer is treated as
+// fully permissive — useful in tests; the production server always
+// passes a real one.
+func NewProxier(cfg Config) *Proxier {
+	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
 	}
+	enforcer := cfg.Enforcer
 	if enforcer == nil {
 		// Build a permissive enforcer to avoid nil dereferences. The
 		// rbac.New(nil) path defaults *all* permit-* to false, so we
@@ -36,7 +57,14 @@ func NewProxier(target *gossh.Client, enforcer *rbac.CertEnforcer, log *slog.Log
 		// path that the request handlers check below.
 		enforcer = rbac.New(permissivePerms())
 	}
-	return &Proxier{target: target, rbac: enforcer, log: log}
+	return &Proxier{
+		target: cfg.Target,
+		rbac:   enforcer,
+		sink:   cfg.Sink,
+		user:   cfg.User,
+		host:   cfg.Host,
+		log:    log,
+	}
 }
 
 // HandleNewChannels iterates over the inbound channels chan from the
@@ -84,7 +112,15 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 		return
 	}
 
-	p.pipeChannel(srcCh, srcReqs, targetCh, targetReqs)
+	// Only "session" channels are recorded. direct-tcpip and the
+	// like are pure transport — no PTY data to capture.
+	var rec *channelRecorder
+	if newCh.ChannelType() == "session" && p.sink != nil {
+		rec = newChannelRecorder(p.sink, p.user, p.host, p.log)
+		defer rec.Close()
+	}
+
+	p.pipeChannel(srcCh, srcReqs, targetCh, targetReqs, rec)
 }
 
 // pipeChannel ferries bytes + requests between an accepted inbound
@@ -97,7 +133,12 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 // from the target) is forwarded BEFORE the user-side channel is
 // closed, so sess.Wait() on the client doesn't return "exited
 // without exit status."
-func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request, targetCh gossh.Channel, targetReqs <-chan *gossh.Request) {
+//
+// When rec is non-nil, target→user data is tee'd into the asciinema
+// recorder and pty-req / window-change requests are forwarded into
+// the recorder's Resize hook. nil rec disables recording for this
+// channel.
+func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request, targetCh gossh.Channel, targetReqs <-chan *gossh.Request, rec *channelRecorder) {
 	// closeBoth tears down both channels. Used as the trigger after
 	// either side has fully drained its data + requests.
 	closeBoth := sync.OnceFunc(func() {
@@ -109,14 +150,19 @@ func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request
 	wg.Add(4)
 
 	// target → user: drain data and requests together, then close.
-	// This is the path that delivers exit-status to the user.
+	// This is the path that delivers exit-status to the user. Data
+	// is tee'd into the recorder when one is configured.
 	go func() {
 		defer wg.Done()
 		var inner sync.WaitGroup
 		inner.Add(2)
 		go func() {
 			defer inner.Done()
-			_, _ = io.Copy(srcCh, targetCh)
+			dst := io.Writer(srcCh)
+			if rec != nil {
+				dst = &recordingTee{w: srcCh, rec: rec}
+			}
+			_, _ = io.Copy(dst, targetCh)
 		}()
 		go func() {
 			defer inner.Done()
@@ -127,7 +173,9 @@ func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request
 	}()
 
 	// user → target: drain data and user requests together. Closes
-	// both when the user finishes (e.g., disconnects).
+	// both when the user finishes (e.g., disconnects). The user-side
+	// request stream is where we observe pty-req + window-change for
+	// the recorder.
 	go func() {
 		defer wg.Done()
 		var inner sync.WaitGroup
@@ -138,7 +186,7 @@ func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request
 		}()
 		go func() {
 			defer inner.Done()
-			p.pipeUserRequests(srcReqs, targetCh)
+			p.pipeUserRequests(srcReqs, targetCh, rec)
 		}()
 		inner.Wait()
 		closeBoth()
@@ -161,8 +209,10 @@ func (p *Proxier) pipeChannel(srcCh gossh.Channel, srcReqs <-chan *gossh.Request
 
 // pipeUserRequests forwards channel requests from the user to the
 // target, applying RBAC gates. Denied requests get a false reply
-// (when WantReply) instead of being forwarded.
-func (p *Proxier) pipeUserRequests(src <-chan *gossh.Request, dst gossh.Channel) {
+// (when WantReply) instead of being forwarded. pty-req and
+// window-change requests are also peeked at so the recorder can
+// learn the terminal dimensions.
+func (p *Proxier) pipeUserRequests(src <-chan *gossh.Request, dst gossh.Channel, rec *channelRecorder) {
 	for req := range src {
 		if !p.permitsRequest(req.Type) {
 			if req.WantReply {
@@ -170,6 +220,25 @@ func (p *Proxier) pipeUserRequests(src <-chan *gossh.Request, dst gossh.Channel)
 			}
 			p.log.Debug("channel request denied by cert", "type", req.Type)
 			continue
+		}
+		// Peek at terminal-shape requests for recording purposes.
+		// Errors here are logged but don't fail the request — audit
+		// is observational.
+		if rec != nil {
+			switch req.Type {
+			case "pty-req":
+				if width, height, err := parsePTYReq(req.Payload); err != nil {
+					p.log.Debug("parse pty-req for recording", "err", err)
+				} else if err := rec.StartIfNeeded(width, height); err != nil {
+					p.log.Warn("start recording", "err", err)
+				}
+			case "window-change":
+				if width, height, err := parseWindowChange(req.Payload); err != nil {
+					p.log.Debug("parse window-change for recording", "err", err)
+				} else {
+					rec.Resize(width, height)
+				}
+			}
 		}
 		ok, err := dst.SendRequest(req.Type, req.WantReply, req.Payload)
 		if err != nil {
@@ -179,6 +248,52 @@ func (p *Proxier) pipeUserRequests(src <-chan *gossh.Request, dst gossh.Channel)
 			_ = req.Reply(ok, nil)
 		}
 	}
+}
+
+// parsePTYReq decodes the cols + rows from an SSH pty-req payload.
+// RFC 4254 6.2: string TERM, uint32 cols, uint32 rows, uint32 width
+// pixels, uint32 height pixels, string modes. We only need cols + rows.
+//
+// Some clients (including OpenSSH's `ssh -tt` from a non-TTY shell)
+// send zero dimensions when they can't query the local terminal. We
+// fall back to a sensible 80x24 default rather than refuse to record
+// the session — the asciinema-player can still replay either way.
+func parsePTYReq(payload []byte) (width, height int, err error) {
+	var p struct {
+		Term         string
+		Cols         uint32
+		Rows         uint32
+		WidthPixels  uint32
+		HeightPixels uint32
+		Modes        string
+	}
+	if err := gossh.Unmarshal(payload, &p); err != nil {
+		return 0, 0, fmt.Errorf("unmarshal pty-req: %w", err)
+	}
+	cols, rows := int(p.Cols), int(p.Rows)
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+	return cols, rows, nil
+}
+
+// parseWindowChange decodes the cols + rows from a window-change
+// payload. RFC 4254 6.7: uint32 cols, uint32 rows, uint32 width
+// pixels, uint32 height pixels. Avoid gossh.Unmarshal for fixed-size
+// payloads — it's just 16 bytes.
+func parseWindowChange(payload []byte) (width, height int, err error) {
+	if len(payload) < 8 {
+		return 0, 0, fmt.Errorf("window-change payload too short: %d bytes", len(payload))
+	}
+	cols := binary.BigEndian.Uint32(payload[0:4])
+	rows := binary.BigEndian.Uint32(payload[4:8])
+	if cols == 0 || rows == 0 {
+		return 0, 0, fmt.Errorf("window-change has zero dimensions %dx%d", cols, rows)
+	}
+	return int(cols), int(rows), nil
 }
 
 // pipeRequestsVerbatim forwards target-side requests (e.g.,

@@ -95,6 +95,18 @@ func signUserCertWithSigner(t *testing.T, ca caBundle, userSigner gossh.Signer, 
 		ValidAfter:      uint64(notBefore.Unix()),
 		ValidBefore:     uint64(notAfter.Unix()),
 		Serial:          42,
+		Permissions: gossh.Permissions{
+			// Test default: grant the full standard set of permit-*
+			// extensions. Tests that specifically exercise an RBAC
+			// denial build their own cert with these omitted.
+			Extensions: map[string]string{
+				"permit-pty":              "",
+				"permit-port-forwarding":  "",
+				"permit-agent-forwarding": "",
+				"permit-X11-forwarding":   "",
+				"permit-user-rc":          "",
+			},
+		},
 	}
 	if err := cert.SignCert(cryptorand.Reader, ca.signer); err != nil {
 		t.Fatalf("sign user cert: %v", err)

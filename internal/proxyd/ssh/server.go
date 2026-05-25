@@ -22,6 +22,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/session"
 )
 
@@ -53,6 +54,9 @@ type Config struct {
 	// that trusts certd-issued host certs); passing
 	// [gossh.InsecureIgnoreHostKey] is dev-only. Required.
 	TargetHostKeyCallback gossh.HostKeyCallback
+	// RecordingSink, when non-nil, captures every session channel's
+	// PTY traffic into an asciinema cast. nil disables recording.
+	RecordingSink recording.Sink
 	// HandshakeTimeout caps the time a single inbound connection
 	// can take to complete the SSH handshake. Defaults to 30s when
 	// zero; prevents slow-loris-style resource exhaustion on the
@@ -222,9 +226,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	s.log.Info("target connected",
 		"target", targetHost, "remote_user", remoteUser)
 
-	// Build the channel proxier with cert-driven RBAC gates.
+	// Build the channel proxier with cert-driven RBAC gates and
+	// optional recording. The Proxier produces one asciinema cast
+	// per session channel under the configured RecordingSink.
 	enforcer := rbac.New(sshConn.Permissions)
-	proxier := session.NewProxier(target, enforcer, s.log)
+	proxier := session.NewProxier(session.Config{
+		Target:   target,
+		Enforcer: enforcer,
+		Sink:     s.cfg.RecordingSink,
+		User:     sshConn.Permissions.Extensions["key-id"],
+		Host:     targetHost,
+		Log:      s.log,
+	})
 	proxier.HandleNewChannels(channels)
 }
 
