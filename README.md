@@ -149,6 +149,14 @@ NATS connection is configured via `SSH_PROXYD_NATS_URL`,
 `SSH_PROXYD_NATS_CA` (falling back to `SSH_PROXYD_WORKLOAD_CA`). When
 unset, audit emission silently degrades to a no-op sink.
 
+## Operations
+
+See [OPERATIONS.md](OPERATIONS.md) for deployment topology, the
+initial-deploy checklist, scenario playbooks (add a tunnel host,
+diagnose stuck sessions, recover from certd / NATS outage, rotate
+the proxy host key), ssh-tunneld lifecycle notes, and monitoring
+hooks.
+
 ## Security
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the per-surface threat
