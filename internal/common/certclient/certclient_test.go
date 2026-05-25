@@ -13,27 +13,41 @@ import (
 )
 
 // mockCertd stands in for the certd service: it accepts POST
-// /api/v1/ssh/sign-user, captures the request for assertions, and
-// returns a canned response (or status code) configured by the test.
+// /api/v1/ssh/sign-user and /api/v1/ssh/sign-host, captures each
+// request for assertions, and returns a canned response (or status
+// code) configured by the test. Only one signing endpoint is hit per
+// test, so a single response slot covers both paths.
 type mockCertd struct {
 	server *httptest.Server
 
-	gotReq    certclient.SignUserRequest
-	respCode  int
-	respBody  []byte
-	respDelay time.Duration
+	gotReq     certclient.SignUserRequest
+	gotHostReq certclient.SignHostRequest
+	respCode   int
+	respBody   []byte
+	respDelay  time.Duration
 }
 
 func newMockCertd(t *testing.T) *mockCertd {
 	t.Helper()
 	m := &mockCertd{respCode: http.StatusOK}
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/ssh/sign-user" {
+		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
 		}
-		if err := json.NewDecoder(r.Body).Decode(&m.gotReq); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		switch r.URL.Path {
+		case "/api/v1/ssh/sign-user":
+			if err := json.NewDecoder(r.Body).Decode(&m.gotReq); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		case "/api/v1/ssh/sign-host":
+			if err := json.NewDecoder(r.Body).Decode(&m.gotHostReq); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		default:
+			http.NotFound(w, r)
 			return
 		}
 		if m.respDelay > 0 {
@@ -162,5 +176,80 @@ func TestClient_SignUserCert_RejectsMalformedResponse(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "decode") {
 		t.Errorf("expected decode error, got %v", err)
+	}
+}
+
+func TestClient_SignHostCert_HappyPath(t *testing.T) {
+	m := newMockCertd(t)
+	now := time.Date(2026, 5, 25, 13, 0, 0, 0, time.UTC)
+	m.respond(t, http.StatusOK, certclient.SignHostResponse{
+		Certificate: "ssh-ed25519-cert-v01@openssh.com AAAA...",
+		Serial:      99,
+		KeyID:       "host:db-1.prod.internal",
+		Principals:  []string{"db-1.prod.internal", "db-1"},
+		ValidAfter:  now,
+		ValidBefore: now.Add(7 * 24 * time.Hour),
+	})
+
+	client, _ := certclient.NewClient(m.server.URL, nil)
+	req := certclient.SignHostRequest{
+		PublicKey:  "ssh-ed25519 AAAA...",
+		KeyID:      "host:db-1.prod.internal",
+		Principals: []string{"db-1.prod.internal", "db-1"},
+		TTLSeconds: 24 * 3600,
+	}
+	resp, err := client.SignHostCert(context.Background(), req)
+	if err != nil {
+		t.Fatalf("SignHostCert: %v", err)
+	}
+	if resp.Serial != 99 {
+		t.Errorf("Serial = %d, want 99", resp.Serial)
+	}
+	if !strings.HasPrefix(resp.Certificate, "ssh-ed25519-cert-v01@openssh.com") {
+		t.Errorf("Certificate = %q", resp.Certificate)
+	}
+	if got := m.gotHostReq.Principals; len(got) != 2 || got[0] != "db-1.prod.internal" {
+		t.Errorf("server saw principals = %v", got)
+	}
+	if m.gotHostReq.TTLSeconds != 24*3600 {
+		t.Errorf("server saw TTL = %d, want %d", m.gotHostReq.TTLSeconds, 24*3600)
+	}
+}
+
+func TestClient_SignHostCert_PropagatesUpstreamError(t *testing.T) {
+	m := newMockCertd(t)
+	m.respond(t, http.StatusForbidden, map[string]string{
+		"error": "caller cert principal not authorized for ssh-tunnel-host role",
+	})
+
+	client, _ := certclient.NewClient(m.server.URL, nil)
+	_, err := client.SignHostCert(context.Background(), certclient.SignHostRequest{
+		PublicKey: "ssh-ed25519 AAAA", KeyID: "host:x", Principals: []string{"x"},
+	})
+	if err == nil {
+		t.Fatal("expected error for 403 response")
+	}
+	if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "ssh-tunnel-host") {
+		t.Errorf("error should surface status+body: %v", err)
+	}
+}
+
+func TestClient_SignHostCert_RespectsContextCancellation(t *testing.T) {
+	m := newMockCertd(t)
+	m.respDelay = 200 * time.Millisecond
+	m.respond(t, http.StatusOK, certclient.SignHostResponse{Serial: 1})
+
+	client, _ := certclient.NewClient(m.server.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := client.SignHostCert(ctx, certclient.SignHostRequest{
+		PublicKey: "ssh-ed25519 AAAA", KeyID: "host:x", Principals: []string{"x"},
+	})
+	if err == nil {
+		t.Fatal("expected context-cancelled error")
+	}
+	if !strings.Contains(err.Error(), "context") && !strings.Contains(err.Error(), "deadline") {
+		t.Errorf("error should mention context/deadline: %v", err)
 	}
 }

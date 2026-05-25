@@ -65,6 +65,14 @@ internal/
 - **The cert is the authorization token.** ssh-proxyd has no policy DB —
   it enforces what the user cert says (allowed-principals, host-pattern
   extension), which certd embedded at sign time per the role table.
+- **ssh-tunneld owns its host identity.** Each tunnel agent renews its
+  own SSH host certificate from certd over its existing workload mTLS
+  identity (no shared bootstrap key). The fresh cert is written
+  atomically to `/etc/ssh/ssh_host_*-cert.pub` and an `OnRenewed` hook
+  notifies sshd (typically SIGHUP). Renewal fires at 60% of the
+  validity envelope by default; signing failures retry without
+  disrupting sshd, which keeps serving with the existing cert until
+  it expires.
 
 ## Audit events
 
