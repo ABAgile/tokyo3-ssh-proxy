@@ -20,7 +20,7 @@ import (
 // plus a cleanup func. The server side is what would normally be
 // registered (it represents the proxy-side handle to the inbound
 // tunnel from ssh-tunneld).
-func twoSessions(t *testing.T) (clientSide, serverSide *yamux.Session) {
+func twoSessions(t testing.TB) (clientSide, serverSide *yamux.Session) {
 	t.Helper()
 	cConn, sConn := net.Pipe()
 

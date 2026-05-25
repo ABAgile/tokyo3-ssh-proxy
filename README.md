@@ -43,6 +43,16 @@ make build         # → bin/ssh-proxyd + bin/ssh-tunneld
 make check         # gofmt + test + staticcheck + gopls + govulncheck
 ```
 
+Benchmarks for the per-handshake hot paths (`rbac` extension checks,
+`routing.Registry` lookups, `revcheck.IsRevoked`, audit serialization):
+
+```sh
+go test -bench=. -benchmem -run=^$ ./internal/proxyd/rbac/...
+go test -bench=. -benchmem -run=^$ ./internal/proxyd/routing/...
+go test -bench=. -benchmem -run=^$ ./internal/proxyd/revcheck/...
+go test -bench=. -benchmem -run=^$ ./internal/audit/...
+```
+
 ## Layout
 
 ```
