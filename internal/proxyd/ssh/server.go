@@ -43,12 +43,13 @@ type Config struct {
 	// accepts. Issued by certd; populated at startup from a file or
 	// API discovery. Required.
 	TrustedUserCA gossh.PublicKey
-	// ClientSigner authenticates the proxy to target sshds when it
-	// opens an outbound connection on behalf of an inbound user.
-	// For this slice it's a static key configured at startup; later
-	// slices replace it with a per-session cert minted by certd.
+	// ClientSignerFunc returns the [gossh.Signer] used to authenticate
+	// to the target sshd on a per-session basis. It is invoked once
+	// per inbound connection with the remote user the cert should
+	// principal-bind to; implementations may return a static key
+	// (dev) or mint a short-lived cert from certd (production).
 	// Required.
-	ClientSigner gossh.Signer
+	ClientSignerFunc func(ctx context.Context, remoteUser string) (gossh.Signer, error)
 	// TargetHostKeyCallback verifies the target sshd's host key.
 	// Production should use a known_hosts-backed callback (or one
 	// that trusts certd-issued host certs); passing
@@ -62,6 +63,16 @@ type Config struct {
 	// zero; prevents slow-loris-style resource exhaustion on the
 	// accept goroutine.
 	HandshakeTimeout time.Duration
+}
+
+// StaticSigner adapts a fixed [gossh.Signer] to the per-session
+// [Config.ClientSignerFunc] shape. Useful for dev / tests where the
+// proxy uses a long-lived shared key instead of certd-minted
+// per-session certs.
+func StaticSigner(sig gossh.Signer) func(context.Context, string) (gossh.Signer, error) {
+	return func(context.Context, string) (gossh.Signer, error) {
+		return sig, nil
+	}
 }
 
 // Server is the SSH gateway. Accepts connections via [ListenAndServe];
@@ -86,8 +97,8 @@ func New(cfg Config) (*Server, error) {
 	if cfg.TrustedUserCA == nil {
 		return nil, errors.New("ssh.New: TrustedUserCA is required")
 	}
-	if cfg.ClientSigner == nil {
-		return nil, errors.New("ssh.New: ClientSigner is required (target-side authentication)")
+	if cfg.ClientSignerFunc == nil {
+		return nil, errors.New("ssh.New: ClientSignerFunc is required (target-side authentication)")
 	}
 	if cfg.TargetHostKeyCallback == nil {
 		return nil, errors.New("ssh.New: TargetHostKeyCallback is required (target-side host key verification)")
@@ -206,12 +217,23 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	remoteUser := sshConn.Permissions.Extensions["remote-user"]
 	targetHost := sshConn.Permissions.Extensions["target-host"]
 
+	// Mint (or fetch) the outbound signer for this session. When
+	// certd is wired, this is a freshly-minted short-lived cert tied
+	// to the user's identity; otherwise it's the static fallback key.
+	signer, err := s.cfg.ClientSignerFunc(ctx, remoteUser)
+	if err != nil {
+		s.log.Warn("obtain client signer", "err", err)
+		rejectAll(ctx, channels, gossh.ConnectionFailed,
+			fmt.Sprintf("proxy could not obtain a client signer: %v", err))
+		return
+	}
+
 	// Dial the target sshd. The handshake timeout doesn't apply
 	// here — DialTarget has its own.
 	target, err := session.DialTarget(ctx, session.DialConfig{
 		Address:         targetHost,
 		User:            remoteUser,
-		Signer:          s.cfg.ClientSigner,
+		Signer:          signer,
 		HostKeyCallback: s.cfg.TargetHostKeyCallback,
 	})
 	if err != nil {

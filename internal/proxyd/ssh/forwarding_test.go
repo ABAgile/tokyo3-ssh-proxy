@@ -164,7 +164,7 @@ func startServerWithTarget(t *testing.T, ca caBundle, proxyClientSigner gossh.Si
 		Log:                   silentLogger(),
 		HostSigner:            newHostSigner(t),
 		TrustedUserCA:         ca.pub,
-		ClientSigner:          proxyClientSigner,
+		ClientSignerFunc:      pssh.StaticSigner(proxyClientSigner),
 		TargetHostKeyCallback: gossh.FixedHostKey(targetHostKey),
 	})
 	if err != nil {

@@ -20,13 +20,25 @@
 //	                        of `ssh-ed25519 AAAA… ca`). Without this,
 //	                        ssh-proxyd has no idea which user certs to
 //	                        trust and refuses to start.
-//	SSH_PROXYD_CLIENT_KEY   Path to a PKCS#8 Ed25519 private key PEM
-//	                        the proxy uses to authenticate to target
-//	                        sshds (as an SSH client). The pubkey must
-//	                        be in each target's authorized_keys for
-//	                        the relevant remote user. Later slices
-//	                        swap this for per-session certs minted by
-//	                        certd.
+//
+// Outbound auth — exactly one of:
+//
+//	CERTD_URL               certd base URL (e.g., https://certd.internal).
+//	                        When set, ssh-proxyd mints a fresh short-lived
+//	                        SSH cert for every session via certd's
+//	                        /api/v1/ssh/sign-user endpoint, presents it to
+//	                        the target, and discards it on session close.
+//	                        Targets must trust the user CA via
+//	                        TrustedUserCAKeys. This is the production
+//	                        path; SSH_PROXYD_CLIENT_KEY is ignored when
+//	                        set. Requires CERTD_MTLS_CERT + CERTD_MTLS_KEY
+//	                        + CERTD_CA_BUNDLE for mTLS to certd.
+//	SSH_PROXYD_CLIENT_KEY   Path to an Ed25519 private key (OpenSSH or
+//	                        PKCS#8 PEM) the proxy uses to authenticate to
+//	                        target sshds with a long-lived shared key.
+//	                        The pubkey must be in each target's
+//	                        authorized_keys for the relevant remote user.
+//	                        Dev / single-target setups only.
 //
 // Optional env vars:
 //
@@ -42,6 +54,16 @@
 //	                     unset, target host keys are NOT verified
 //	                     (InsecureIgnoreHostKey) — dev only.
 //
+//	CERTD_MTLS_CERT      Client cert PEM the proxy presents to certd
+//	                     during the sign-user call. Required iff
+//	                     CERTD_URL is set.
+//	CERTD_MTLS_KEY       Matching client key PEM.
+//	CERTD_CA_BUNDLE      CA PEM that verifies certd's server cert.
+//
+//	CERTD_SESSION_TTL_SECONDS  TTL of each per-session cert minted by
+//	                     certd. Defaults to 300 (5 minutes). Cap at
+//	                     certd's user-cert max (24h by default).
+//
 //	SSH_PROXYD_CAST_DIR  Directory where asciinema cast files are
 //	                     written, one per recorded session. When
 //	                     unset, session recording is disabled — the
@@ -53,19 +75,25 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/google/uuid"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/spf13/cobra"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
 )
@@ -115,12 +143,10 @@ func runServe(ctx context.Context) error {
 	}
 	log.Info("user ca ready", "fingerprint", gossh.FingerprintSHA256(userCA))
 
-	clientSigner, err := loadClientKey()
+	signerFunc, err := loadClientSignerFunc(log)
 	if err != nil {
-		return fmt.Errorf("client key: %w", err)
+		return fmt.Errorf("client signer: %w", err)
 	}
-	log.Info("target-side client key ready",
-		"fingerprint", gossh.FingerprintSHA256(clientSigner.PublicKey()))
 
 	hostKeyCB, err := loadTargetHostKeyCallback(log)
 	if err != nil {
@@ -137,7 +163,7 @@ func runServe(ctx context.Context) error {
 		Log:                   log,
 		HostSigner:            hostSigner,
 		TrustedUserCA:         userCA,
-		ClientSigner:          clientSigner,
+		ClientSignerFunc:      signerFunc,
 		TargetHostKeyCallback: hostKeyCB,
 		RecordingSink:         sink,
 	})
@@ -220,15 +246,138 @@ func loadUserCA() (gossh.PublicKey, error) {
 	return pub, nil
 }
 
-// loadClientKey reads the proxy's outbound (target-side) SSH client
-// key from SSH_PROXYD_CLIENT_KEY. Required. Accepts both OpenSSH
-// format (the ssh-keygen default) and PKCS#8 PEM.
-func loadClientKey() (gossh.Signer, error) {
+// loadClientSignerFunc decides how the proxy authenticates to target
+// sshds. Precedence:
+//
+//  1. CERTD_URL set → mint a fresh short-lived SSH cert per session
+//     via certd. The static client key, if also set, is ignored.
+//  2. SSH_PROXYD_CLIENT_KEY set → fall back to the static long-lived
+//     key. The pubkey must be authorized on every target.
+//
+// Exactly one must be configured; both empty fails fast at startup.
+func loadClientSignerFunc(log *slog.Logger) (func(context.Context, string) (gossh.Signer, error), error) {
+	if url := os.Getenv("CERTD_URL"); url != "" {
+		if os.Getenv("SSH_PROXYD_CLIENT_KEY") != "" {
+			log.Warn("CERTD_URL is set — ignoring SSH_PROXYD_CLIENT_KEY")
+		}
+		return newCertdMinter(url, log)
+	}
 	path := os.Getenv("SSH_PROXYD_CLIENT_KEY")
 	if path == "" {
-		return nil, errors.New("SSH_PROXYD_CLIENT_KEY is required (Ed25519 private key the proxy authenticates to targets with; OpenSSH or PKCS#8 PEM)")
+		return nil, errors.New("either CERTD_URL or SSH_PROXYD_CLIENT_KEY is required for target-side authentication")
 	}
-	return loadSSHPrivateKey(path)
+	signer, err := loadSSHPrivateKey(path)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("target-side static client key loaded",
+		"fingerprint", gossh.FingerprintSHA256(signer.PublicKey()))
+	return pssh.StaticSigner(signer), nil
+}
+
+// newCertdMinter builds the per-session minter. Each call to the
+// returned func generates a fresh Ed25519 keypair, asks certd to
+// sign a user cert for the requested principal with a short TTL,
+// and returns the ready-to-use [gossh.Signer].
+func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, string) (gossh.Signer, error), error) {
+	tlsCfg, err := loadCertdMTLS()
+	if err != nil {
+		return nil, err
+	}
+	client, err := certclient.NewClient(certdURL, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	ttl := int64(300)
+	if v := os.Getenv("CERTD_SESSION_TTL_SECONDS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("CERTD_SESSION_TTL_SECONDS %q: must be positive integer", v)
+		}
+		ttl = n
+	}
+	log.Info("certd session minting enabled", "url", certdURL, "ttl_seconds", ttl)
+	return func(ctx context.Context, principal string) (gossh.Signer, error) {
+		// Fresh Ed25519 keypair per session — never reused, never
+		// persisted. The cert lives only as long as the session.
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("generate session key: %w", err)
+		}
+		sshPub, err := gossh.NewPublicKey(priv.Public())
+		if err != nil {
+			return nil, fmt.Errorf("wrap session pubkey: %w", err)
+		}
+		pubAuth := strings.TrimRight(string(gossh.MarshalAuthorizedKey(sshPub)), "\n")
+		sessionID := uuid.NewString()
+		keyID := "session:" + sessionID + ":principal:" + principal
+
+		resp, err := client.SignUserCert(ctx, certclient.SignUserRequest{
+			PublicKey:  pubAuth,
+			KeyID:      keyID,
+			Principals: []string{principal},
+			TTLSeconds: ttl,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("certd sign-user: %w", err)
+		}
+		// Parse the returned cert + wrap with the matching private key.
+		parsed, _, _, _, err := gossh.ParseAuthorizedKey([]byte(resp.Certificate))
+		if err != nil {
+			return nil, fmt.Errorf("parse minted cert: %w", err)
+		}
+		cert, ok := parsed.(*gossh.Certificate)
+		if !ok {
+			return nil, errors.New("certd response is not a Certificate")
+		}
+		baseSigner, err := gossh.NewSignerFromKey(priv)
+		if err != nil {
+			return nil, fmt.Errorf("wrap session private key: %w", err)
+		}
+		certSigner, err := gossh.NewCertSigner(cert, baseSigner)
+		if err != nil {
+			return nil, fmt.Errorf("build cert signer: %w", err)
+		}
+		log.Info("session cert minted",
+			"session_id", sessionID,
+			"principal", principal,
+			"serial", resp.Serial,
+			"valid_before", resp.ValidBefore,
+		)
+		return certSigner, nil
+	}, nil
+}
+
+// loadCertdMTLS builds the *tls.Config presented to certd. The proxy
+// authenticates with its workload identity cert; certd's role table
+// maps the cert principal to a role that allows session minting.
+func loadCertdMTLS() (*tls.Config, error) {
+	certFile := os.Getenv("CERTD_MTLS_CERT")
+	keyFile := os.Getenv("CERTD_MTLS_KEY")
+	caBundle := os.Getenv("CERTD_CA_BUNDLE")
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
+	}
+	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load client cert pair: %w", err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{keyPair},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if caBundle != "" {
+		pem, err := os.ReadFile(caBundle)
+		if err != nil {
+			return nil, fmt.Errorf("read CERTD_CA_BUNDLE: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("CERTD_CA_BUNDLE %s contains no PEM certs", caBundle)
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg, nil
 }
 
 // loadSSHPrivateKey reads any supported private key file and returns

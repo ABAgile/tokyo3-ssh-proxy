@@ -130,7 +130,7 @@ func startServer(t *testing.T, ca caBundle) (addr string, stop func()) {
 		Log:                   silentLogger(),
 		HostSigner:            newHostSigner(t),
 		TrustedUserCA:         ca.pub,
-		ClientSigner:          newHostSigner(t), // stub — never reached when target dial fails
+		ClientSignerFunc:      pssh.StaticSigner(newHostSigner(t)), // stub — never reached when target dial fails
 		TargetHostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	})
 	if err != nil {
@@ -175,7 +175,7 @@ func dialAsUser(addr string, username string, auth gossh.AuthMethod) (*gossh.Cli
 
 func TestNew_RejectsMissingConfig(t *testing.T) {
 	host := newHostSigner(t)
-	clientSigner := newHostSigner(t)
+	signerFn := pssh.StaticSigner(newHostSigner(t))
 	ca := newCA(t)
 	cb := gossh.InsecureIgnoreHostKey()
 	tests := []struct {
@@ -185,27 +185,27 @@ func TestNew_RejectsMissingConfig(t *testing.T) {
 	}{
 		{
 			"missing addr",
-			pssh.Config{HostSigner: host, TrustedUserCA: ca.pub, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			pssh.Config{HostSigner: host, TrustedUserCA: ca.pub, ClientSignerFunc: signerFn, TargetHostKeyCallback: cb},
 			"Addr is required",
 		},
 		{
 			"missing host signer",
-			pssh.Config{Addr: ":2222", TrustedUserCA: ca.pub, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			pssh.Config{Addr: ":2222", TrustedUserCA: ca.pub, ClientSignerFunc: signerFn, TargetHostKeyCallback: cb},
 			"HostSigner is required",
 		},
 		{
 			"missing user ca",
-			pssh.Config{Addr: ":2222", HostSigner: host, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			pssh.Config{Addr: ":2222", HostSigner: host, ClientSignerFunc: signerFn, TargetHostKeyCallback: cb},
 			"TrustedUserCA is required",
 		},
 		{
 			"missing client signer",
 			pssh.Config{Addr: ":2222", HostSigner: host, TrustedUserCA: ca.pub, TargetHostKeyCallback: cb},
-			"ClientSigner is required",
+			"ClientSignerFunc is required",
 		},
 		{
 			"missing target host-key callback",
-			pssh.Config{Addr: ":2222", HostSigner: host, TrustedUserCA: ca.pub, ClientSigner: clientSigner},
+			pssh.Config{Addr: ":2222", HostSigner: host, TrustedUserCA: ca.pub, ClientSignerFunc: signerFn},
 			"TargetHostKeyCallback is required",
 		},
 	}
@@ -368,7 +368,7 @@ func TestServer_GracefulShutdownWaitsForInFlight(t *testing.T) {
 		Log:                   silentLogger(),
 		HostSigner:            newHostSigner(t),
 		TrustedUserCA:         ca.pub,
-		ClientSigner:          newHostSigner(t),
+		ClientSignerFunc:      pssh.StaticSigner(newHostSigner(t)),
 		TargetHostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	})
 	if err != nil {
