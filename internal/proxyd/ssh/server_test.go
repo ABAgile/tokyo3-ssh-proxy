@@ -107,14 +107,19 @@ func signUserCertWithSigner(t *testing.T, ca caBundle, userSigner gossh.Signer, 
 }
 
 // startServer brings up a Server bound to a kernel-assigned port,
-// returns the address and a stop callback the test defers.
+// returns the address and a stop callback the test defers. The
+// client-side signer + host-key callback are populated with stubs
+// suitable for tests that don't reach a real target; tests that do
+// pipe end-to-end use [startServerWithTarget] instead.
 func startServer(t *testing.T, ca caBundle) (addr string, stop func()) {
 	t.Helper()
 	srv, err := pssh.New(pssh.Config{
-		Addr:          "127.0.0.1:0",
-		Log:           silentLogger(),
-		HostSigner:    newHostSigner(t),
-		TrustedUserCA: ca.pub,
+		Addr:                  "127.0.0.1:0",
+		Log:                   silentLogger(),
+		HostSigner:            newHostSigner(t),
+		TrustedUserCA:         ca.pub,
+		ClientSigner:          newHostSigner(t), // stub — never reached when target dial fails
+		TargetHostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	})
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
@@ -158,15 +163,39 @@ func dialAsUser(addr string, username string, auth gossh.AuthMethod) (*gossh.Cli
 
 func TestNew_RejectsMissingConfig(t *testing.T) {
 	host := newHostSigner(t)
+	clientSigner := newHostSigner(t)
 	ca := newCA(t)
+	cb := gossh.InsecureIgnoreHostKey()
 	tests := []struct {
 		name string
 		cfg  pssh.Config
 		want string
 	}{
-		{"missing addr", pssh.Config{HostSigner: host, TrustedUserCA: ca.pub}, "Addr is required"},
-		{"missing host signer", pssh.Config{Addr: ":2222", TrustedUserCA: ca.pub}, "HostSigner is required"},
-		{"missing user ca", pssh.Config{Addr: ":2222", HostSigner: host}, "TrustedUserCA is required"},
+		{
+			"missing addr",
+			pssh.Config{HostSigner: host, TrustedUserCA: ca.pub, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			"Addr is required",
+		},
+		{
+			"missing host signer",
+			pssh.Config{Addr: ":2222", TrustedUserCA: ca.pub, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			"HostSigner is required",
+		},
+		{
+			"missing user ca",
+			pssh.Config{Addr: ":2222", HostSigner: host, ClientSigner: clientSigner, TargetHostKeyCallback: cb},
+			"TrustedUserCA is required",
+		},
+		{
+			"missing client signer",
+			pssh.Config{Addr: ":2222", HostSigner: host, TrustedUserCA: ca.pub, TargetHostKeyCallback: cb},
+			"ClientSigner is required",
+		},
+		{
+			"missing target host-key callback",
+			pssh.Config{Addr: ":2222", HostSigner: host, TrustedUserCA: ca.pub, ClientSigner: clientSigner},
+			"TargetHostKeyCallback is required",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -179,6 +208,9 @@ func TestNew_RejectsMissingConfig(t *testing.T) {
 }
 
 func TestServer_AcceptsValidUserCert(t *testing.T) {
+	// Handshake succeeds (cert is valid) but the target host doesn't
+	// exist, so channel-open propagates "target unreachable" — this
+	// proves the cert path works without needing a real backend.
 	ca := newCA(t)
 	addr, stop := startServer(t, ca)
 	defer stop()
@@ -186,20 +218,41 @@ func TestServer_AcceptsValidUserCert(t *testing.T) {
 	userSigner := newUserKey(t)
 	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
 
-	client, err := dialAsUser(addr, "alice", gossh.PublicKeys(certSigner))
+	client, err := dialAsUser(addr, "alice@127.0.0.1:1", gossh.PublicKeys(certSigner))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer client.Close()
 
-	// Open a session; expect channel rejection with the placeholder
-	// message — handshake succeeded so we know auth worked.
+	// Open a session — handshake succeeded so we know auth worked;
+	// the channel is rejected because the (intentionally) bogus
+	// target port can't be reached.
 	_, err = client.NewSession()
 	if err == nil {
-		t.Fatal("expected NewSession to fail with placeholder rejection")
+		t.Fatal("expected NewSession to fail (target unreachable)")
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("expected placeholder rejection, got %v", err)
+	if !strings.Contains(err.Error(), "target unreachable") {
+		t.Errorf("expected target-unreachable rejection, got %v", err)
+	}
+}
+
+func TestServer_RejectsMissingAtInUsername(t *testing.T) {
+	// Username with no "@" can't be parsed into a target. The server
+	// surfaces this as a handshake failure (early reject in
+	// publicKeyCallback) so the user can't even open a session — fail
+	// fast on malformed input.
+	ca := newCA(t)
+	addr, stop := startServer(t, ca)
+	defer stop()
+
+	userSigner := newUserKey(t)
+	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
+
+	// Bare "alice" — no "@", so publicKeyCallback returns the parse
+	// error before the cert is even checked.
+	_, err := dialAsUser(addr, "alice", gossh.PublicKeys(certSigner))
+	if err == nil {
+		t.Fatal("expected dial to fail (bad username)")
 	}
 }
 
@@ -211,7 +264,7 @@ func TestServer_RejectsUnsignedKey(t *testing.T) {
 	// User auths with a raw pubkey (no cert) — must be rejected
 	// because the server's PublicKeyCallback only accepts certs.
 	userSigner := newUserKey(t)
-	_, err := dialAsUser(addr, "alice", gossh.PublicKeys(userSigner))
+	_, err := dialAsUser(addr, "alice@target.invalid", gossh.PublicKeys(userSigner))
 	if err == nil {
 		t.Fatal("dial succeeded; server should reject non-cert keys")
 	}
@@ -227,7 +280,7 @@ func TestServer_RejectsCertFromWrongCA(t *testing.T) {
 	userSigner := newUserKey(t)
 	certSigner := signUserCertWithSigner(t, caOther, userSigner, []string{"alice"}, time.Time{}, time.Time{})
 
-	_, err := dialAsUser(addr, "alice", gossh.PublicKeys(certSigner))
+	_, err := dialAsUser(addr, "alice@target.invalid", gossh.PublicKeys(certSigner))
 	if err == nil {
 		t.Fatal("dial succeeded; cert is from an untrusted CA")
 	}
@@ -243,7 +296,7 @@ func TestServer_RejectsExpiredCert(t *testing.T) {
 	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"},
 		past, past.Add(time.Hour) /* expired an hour ago */)
 
-	_, err := dialAsUser(addr, "alice", gossh.PublicKeys(certSigner))
+	_, err := dialAsUser(addr, "alice@target.invalid", gossh.PublicKeys(certSigner))
 	if err == nil {
 		t.Fatal("dial succeeded; cert is expired")
 	}
@@ -258,7 +311,7 @@ func TestServer_RejectsPrincipalMismatch(t *testing.T) {
 	// Cert valid only for "alice"; client requests user "bob".
 	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
 
-	_, err := dialAsUser(addr, "bob", gossh.PublicKeys(certSigner))
+	_, err := dialAsUser(addr, "bob@target.invalid", gossh.PublicKeys(certSigner))
 	if err == nil {
 		t.Fatal("dial succeeded; principal does not match requested user")
 	}
@@ -288,7 +341,7 @@ func TestServer_RejectsHostCertAsUserAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cert signer: %v", err)
 	}
-	if _, err := dialAsUser(addr, "alice", gossh.PublicKeys(certSigner)); err == nil {
+	if _, err := dialAsUser(addr, "alice@target.invalid", gossh.PublicKeys(certSigner)); err == nil {
 		t.Fatal("dial succeeded; host cert should not be accepted for user auth")
 	}
 }
@@ -299,10 +352,12 @@ func TestServer_GracefulShutdownWaitsForInFlight(t *testing.T) {
 	// (placeholder-rejected) in-flight session.
 	ca := newCA(t)
 	srv, err := pssh.New(pssh.Config{
-		Addr:          "127.0.0.1:0",
-		Log:           silentLogger(),
-		HostSigner:    newHostSigner(t),
-		TrustedUserCA: ca.pub,
+		Addr:                  "127.0.0.1:0",
+		Log:                   silentLogger(),
+		HostSigner:            newHostSigner(t),
+		TrustedUserCA:         ca.pub,
+		ClientSigner:          newHostSigner(t),
+		TargetHostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -327,7 +382,7 @@ func TestServer_GracefulShutdownWaitsForInFlight(t *testing.T) {
 	// handshake goroutine is already running.
 	userSigner := newUserKey(t)
 	cs := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
-	c, err := dialAsUser(srv.Addr(), "alice", gossh.PublicKeys(cs))
+	c, err := dialAsUser(srv.Addr(), "alice@target.invalid", gossh.PublicKeys(cs))
 	if err != nil {
 		cancel()
 		t.Fatalf("dial: %v", err)

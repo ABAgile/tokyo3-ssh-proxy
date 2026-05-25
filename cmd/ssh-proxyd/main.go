@@ -15,11 +15,18 @@
 //
 // Required env vars:
 //
-//	SSH_PROXYD_USER_CA   Path to the SSH user CA public key in
-//	                     authorized_keys format (e.g., the contents of
-//	                     `ssh-ed25519 AAAA… tokyo3-ca`). Without this,
-//	                     ssh-proxyd has no idea which user certs to
-//	                     trust and refuses to start.
+//	SSH_PROXYD_USER_CA      Path to the SSH user CA public key in
+//	                        authorized_keys format (e.g., the contents
+//	                        of `ssh-ed25519 AAAA… ca`). Without this,
+//	                        ssh-proxyd has no idea which user certs to
+//	                        trust and refuses to start.
+//	SSH_PROXYD_CLIENT_KEY   Path to a PKCS#8 Ed25519 private key PEM
+//	                        the proxy uses to authenticate to target
+//	                        sshds (as an SSH client). The pubkey must
+//	                        be in each target's authorized_keys for
+//	                        the relevant remote user. Later slices
+//	                        swap this for per-session certs minted by
+//	                        certd.
 //
 // Optional env vars:
 //
@@ -29,14 +36,17 @@
 //	                     ssh-proxyd generates an ephemeral key at
 //	                     startup — dev only; clients will see a
 //	                     different host key after every restart.
+//
+//	SSH_PROXYD_TARGET_KNOWN_HOSTS  Path to a known_hosts-format file
+//	                     used to verify target sshd host keys. When
+//	                     unset, target host keys are NOT verified
+//	                     (InsecureIgnoreHostKey) — dev only.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,6 +56,7 @@ import (
 
 	"github.com/abagile/tokyo3-base/applog"
 	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/spf13/cobra"
 
@@ -97,11 +108,25 @@ func runServe(ctx context.Context) error {
 	}
 	log.Info("user ca ready", "fingerprint", gossh.FingerprintSHA256(userCA))
 
+	clientSigner, err := loadClientKey()
+	if err != nil {
+		return fmt.Errorf("client key: %w", err)
+	}
+	log.Info("target-side client key ready",
+		"fingerprint", gossh.FingerprintSHA256(clientSigner.PublicKey()))
+
+	hostKeyCB, err := loadTargetHostKeyCallback(log)
+	if err != nil {
+		return fmt.Errorf("target host key callback: %w", err)
+	}
+
 	srv, err := pssh.New(pssh.Config{
-		Addr:          addr,
-		Log:           log,
-		HostSigner:    hostSigner,
-		TrustedUserCA: userCA,
+		Addr:                  addr,
+		Log:                   log,
+		HostSigner:            hostSigner,
+		TrustedUserCA:         userCA,
+		ClientSigner:          clientSigner,
+		TargetHostKeyCallback: hostKeyCB,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh server: %w", err)
@@ -137,29 +162,15 @@ func envOr(key, fallback string) string {
 }
 
 // loadHostKey returns the SSH host signer. When SSH_PROXYD_HOST_KEY
-// is set, the file is read as a PKCS#8 Ed25519 PEM block; otherwise
-// an ephemeral keypair is generated at startup with a warning.
+// is set, the file is parsed via [gossh.ParsePrivateKey] which
+// accepts both OpenSSH format ("OPENSSH PRIVATE KEY" PEM block, the
+// default ssh-keygen writes) and PKCS#8 format. Otherwise an
+// ephemeral keypair is generated at startup with a warning.
 func loadHostKey(log *slog.Logger) (gossh.Signer, error) {
 	if path := os.Getenv("SSH_PROXYD_HOST_KEY"); path != "" {
-		b, err := os.ReadFile(path)
+		signer, err := loadSSHPrivateKey(path)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
-		}
-		block, _ := pem.Decode(b)
-		if block == nil {
-			return nil, fmt.Errorf("%s does not contain a PEM block", path)
-		}
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
-		}
-		priv, ok := key.(ed25519.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("%s: expected ed25519 private key, got %T", path, key)
-		}
-		signer, err := gossh.NewSignerFromKey(priv)
-		if err != nil {
-			return nil, fmt.Errorf("wrap host key as ssh.Signer: %w", err)
+			return nil, err
 		}
 		log.Info("ssh host key loaded", "path", path, "fingerprint", gossh.FingerprintSHA256(signer.PublicKey()))
 		return signer, nil
@@ -194,4 +205,51 @@ func loadUserCA() (gossh.PublicKey, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return pub, nil
+}
+
+// loadClientKey reads the proxy's outbound (target-side) SSH client
+// key from SSH_PROXYD_CLIENT_KEY. Required. Accepts both OpenSSH
+// format (the ssh-keygen default) and PKCS#8 PEM.
+func loadClientKey() (gossh.Signer, error) {
+	path := os.Getenv("SSH_PROXYD_CLIENT_KEY")
+	if path == "" {
+		return nil, errors.New("SSH_PROXYD_CLIENT_KEY is required (Ed25519 private key the proxy authenticates to targets with; OpenSSH or PKCS#8 PEM)")
+	}
+	return loadSSHPrivateKey(path)
+}
+
+// loadSSHPrivateKey reads any supported private key file and returns
+// an ssh.Signer. [gossh.ParsePrivateKey] handles OpenSSH-format
+// ("OPENSSH PRIVATE KEY" PEM blocks, the default ssh-keygen writes)
+// and PKCS#8 alike, so callers don't need to know which format the
+// file holds.
+func loadSSHPrivateKey(path string) (gossh.Signer, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	signer, err := gossh.ParsePrivateKey(b)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return signer, nil
+}
+
+// loadTargetHostKeyCallback returns the callback used to verify the
+// host keys of target sshds the proxy dials out to. When
+// SSH_PROXYD_TARGET_KNOWN_HOSTS is set, the file is parsed via
+// golang.org/x/crypto/ssh/knownhosts and its callback is used.
+// Otherwise InsecureIgnoreHostKey is returned with a startup warning
+// — acceptable only for dev environments.
+func loadTargetHostKeyCallback(log *slog.Logger) (gossh.HostKeyCallback, error) {
+	if path := os.Getenv("SSH_PROXYD_TARGET_KNOWN_HOSTS"); path != "" {
+		cb, err := knownhosts.New(path)
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", path, err)
+		}
+		log.Info("target host keys verified via known_hosts", "path", path)
+		return cb, nil
+	}
+	log.Warn("SSH_PROXYD_TARGET_KNOWN_HOSTS unset — target sshd host keys are NOT verified (dev only)")
+	return gossh.InsecureIgnoreHostKey(), nil
 }
