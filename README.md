@@ -15,18 +15,52 @@ This repo ships two binaries:
 
 ## Status
 
-**MVP wired end-to-end.** `ssh-proxyd serve` is a full SSH gateway with
-cert-based user auth, per-session cert minting from certd, asciinema
-recording, audit emission, and (optional) inbound tunnel acceptance.
-`ssh-tunneld run` is a full reverse-tunnel agent: holds an outbound
-mTLS+yamux session to ssh-proxyd, forwards inbound streams to local
-sshd, and renews its host SSH cert when configured.
+**Production-shape, with the documented caveats.** `ssh-proxyd
+serve` is a full SSH gateway: cert-based user auth, source-address
+restrictions, per-session cert minting from certd, asciinema
+recording, port-forward + SCP/SFTP-kickoff audit, inbound tunnel
+acceptance, and revocation polling against certd's snapshot.
+`ssh-tunneld run` is a full reverse-tunnel agent: outbound
+mTLS+yamux to ssh-proxyd, forwards inbound streams to local sshd,
+and renews its host SSH cert via certd when configured.
+
+Phase 7 hardening landed:
+[THREAT_MODEL.md](THREAT_MODEL.md) (per-surface threats +
+mitigations), [OPERATIONS.md](OPERATIONS.md) (deploy/scenario
+runbooks), benchmark suite (`go test -bench=. -benchmem ./...`),
+PTY recording stress tests, and an end-to-end revocation test
+that proves the certd→proxy refusal loop closes through the
+handshake layer.
+
+Operational caveats are tracked in [OPERATIONS.md §6](OPERATIONS.md):
+per-process tunnel registry (no cluster-wide routing yet),
+audit-publish loss tolerance during NATS outage, unbounded cast
+disk without OS quotas, and SCP/SFTP audit only captures the
+kickoff (no per-file paths).
 
 See the `go doc` comments in `cmd/ssh-proxyd/main.go` and
-`cmd/ssh-tunneld/main.go` for the full env-var matrix. The
-`SSH_PROXYD_TUNNEL_*` and `SSH_TUNNELD_*` variables wire the
-reverse-tunnel path; without them the proxy still works in
-direct-TCP mode.
+`cmd/ssh-tunneld/main.go` for the full env-var matrix.
+
+## User access
+
+End users don't talk to ssh-proxyd directly with `ssh -J`; they use
+`auth-ssh-creds` to exchange an SSO ID token for a short-lived SSH
+user certificate, which `ssh` then presents at the gateway. The
+helper also emits an `ssh_config` snippet pointing at this proxy
+when invoked with `--proxy-jump <ssh-proxyd-host:port>`, so a single
+`ssh <target>` routes through here transparently.
+
+The helper lives in [tokyo3-ca](https://github.com/abagile/tokyo3-ca)
+because its wire shape tracks certd's `/api/v1/ssh/sign-user`
+endpoint — install it with:
+
+```sh
+go install github.com/abagile/tokyo3-ca/cmd/auth-ssh-creds@latest
+```
+
+Or pull the published image: `ghcr.io/abagile/tokyo3-ca-cli`. See
+the [tokyo3-ca README](https://github.com/abagile/tokyo3-ca#cli-access-via-auth-ssh-creds)
+for full flag reference, cache layout, and the `--proxy-jump` workflow.
 
 ## Requirements
 
