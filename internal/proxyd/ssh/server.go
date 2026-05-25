@@ -11,6 +11,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,8 +20,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/session"
@@ -58,6 +61,10 @@ type Config struct {
 	// RecordingSink, when non-nil, captures every session channel's
 	// PTY traffic into an asciinema cast. nil disables recording.
 	RecordingSink recording.Sink
+	// Audit, when non-nil, receives session lifecycle + channel
+	// rejection events. When nil, [audit.NoopSink] is used (events
+	// are discarded silently).
+	Audit audit.Sink
 	// HandshakeTimeout caps the time a single inbound connection
 	// can take to complete the SSH handshake. Defaults to 30s when
 	// zero; prevents slow-loris-style resource exhaustion on the
@@ -198,55 +205,69 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// can be long-lived.
 	_ = conn.SetDeadline(time.Time{})
 
+	// Build the session attribution once at handshake-complete and
+	// reuse it across every event emitted for this connection.
+	ev := sessionEvents{
+		sink:       s.audit(),
+		log:        s.log,
+		sessionID:  uuid.NewString(),
+		user:       sshConn.Permissions.Extensions["key-id"],
+		principals: sshConn.Permissions.Extensions["principals"],
+		target:     sshConn.Permissions.Extensions["target-host"],
+		remoteUser: sshConn.Permissions.Extensions["remote-user"],
+		clientIP:   ipFromAddr(conn.RemoteAddr()),
+	}
+
 	s.log.Info("ssh session opened",
+		"session_id", ev.sessionID,
 		"user", sshConn.User(),
-		"key_id", sshConn.Permissions.Extensions["key-id"],
-		"principals", sshConn.Permissions.Extensions["principals"],
+		"key_id", ev.user,
+		"principals", ev.principals,
 		"remote", conn.RemoteAddr(),
 	)
+	ev.emit(ctx, audit.ActionSessionOpened, "", nil)
 	defer func() {
-		s.log.Info("ssh session closed", "user", sshConn.User(), "remote", conn.RemoteAddr())
+		s.log.Info("ssh session closed",
+			"session_id", ev.sessionID, "user", sshConn.User(), "remote", conn.RemoteAddr())
+		ev.emit(ctx, audit.ActionSessionClosed, "", nil)
 		_ = sshConn.Close()
 	}()
 
 	// Global out-of-band requests are not used yet — discard.
 	go gossh.DiscardRequests(requests)
 
-	// remote-user + target-host were resolved at handshake time by
-	// publicKeyCallback and stashed in Permissions.Extensions.
-	remoteUser := sshConn.Permissions.Extensions["remote-user"]
-	targetHost := sshConn.Permissions.Extensions["target-host"]
-
 	// Mint (or fetch) the outbound signer for this session. When
 	// certd is wired, this is a freshly-minted short-lived cert tied
 	// to the user's identity; otherwise it's the static fallback key.
-	signer, err := s.cfg.ClientSignerFunc(ctx, remoteUser)
+	signer, err := s.cfg.ClientSignerFunc(ctx, ev.remoteUser)
 	if err != nil {
+		reason := fmt.Sprintf("proxy could not obtain a client signer: %v", err)
 		s.log.Warn("obtain client signer", "err", err)
-		rejectAll(ctx, channels, gossh.ConnectionFailed,
-			fmt.Sprintf("proxy could not obtain a client signer: %v", err))
+		ev.emit(ctx, audit.ActionChannelRejected, reason, map[string]any{"stage": "client_signer"})
+		rejectAll(ctx, channels, gossh.ConnectionFailed, reason)
 		return
 	}
 
 	// Dial the target sshd. The handshake timeout doesn't apply
 	// here — DialTarget has its own.
 	target, err := session.DialTarget(ctx, session.DialConfig{
-		Address:         targetHost,
-		User:            remoteUser,
+		Address:         ev.target,
+		User:            ev.remoteUser,
 		Signer:          signer,
 		HostKeyCallback: s.cfg.TargetHostKeyCallback,
 	})
 	if err != nil {
+		reason := fmt.Sprintf("target unreachable: %v", err)
 		s.log.Warn("target dial failed",
-			"target", targetHost, "remote_user", remoteUser, "err", err)
-		rejectAll(ctx, channels, gossh.ConnectionFailed,
-			fmt.Sprintf("target unreachable: %v", err))
+			"target", ev.target, "remote_user", ev.remoteUser, "err", err)
+		ev.emit(ctx, audit.ActionChannelRejected, reason, map[string]any{"stage": "target_dial"})
+		rejectAll(ctx, channels, gossh.ConnectionFailed, reason)
 		return
 	}
 	defer target.Close()
 
 	s.log.Info("target connected",
-		"target", targetHost, "remote_user", remoteUser)
+		"session_id", ev.sessionID, "target", ev.target, "remote_user", ev.remoteUser)
 
 	// Build the channel proxier with cert-driven RBAC gates and
 	// optional recording. The Proxier produces one asciinema cast
@@ -256,11 +277,74 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		Target:   target,
 		Enforcer: enforcer,
 		Sink:     s.cfg.RecordingSink,
-		User:     sshConn.Permissions.Extensions["key-id"],
-		Host:     targetHost,
+		User:     ev.user,
+		Host:     ev.target,
 		Log:      s.log,
 	})
 	proxier.HandleNewChannels(channels)
+}
+
+// audit returns the audit sink, defaulting to NoopSink when the
+// Config didn't set one. Reading the field through this accessor
+// keeps the nil-safe pattern in one place.
+func (s *Server) audit() audit.Sink {
+	if s.cfg.Audit == nil {
+		return audit.NoopSink
+	}
+	return s.cfg.Audit
+}
+
+// sessionEvents bundles the per-connection attribution shared by
+// every audit emission ssh-proxyd makes during one inbound session.
+type sessionEvents struct {
+	sink       audit.Sink
+	log        *slog.Logger
+	sessionID  string
+	user       string
+	principals string
+	target     string
+	remoteUser string
+	clientIP   string
+}
+
+// emit packages an audit Entry and fires the sink. Errors are logged
+// but never fail the request — audit is observational.
+func (e *sessionEvents) emit(ctx context.Context, action, reason string, metadata map[string]any) {
+	var md string
+	if len(metadata) > 0 {
+		if b, err := json.Marshal(metadata); err == nil {
+			md = string(b)
+		}
+	}
+	entry := audit.Entry{
+		ID:         uuid.NewString(),
+		Action:     action,
+		SessionID:  e.sessionID,
+		User:       e.user,
+		Principals: e.principals,
+		Target:     e.target,
+		RemoteUser: e.remoteUser,
+		ClientIP:   e.clientIP,
+		Reason:     reason,
+		Metadata:   md,
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := e.sink.Append(ctx, entry); err != nil {
+		e.log.Warn("audit append failed", "action", action, "err", err)
+	}
+}
+
+// ipFromAddr extracts a bare IP from a net.Addr; returns the
+// remote's string representation on parse failure.
+func ipFromAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }
 
 // rejectAll drains every remaining NewChannel from chans, rejecting

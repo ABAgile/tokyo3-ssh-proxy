@@ -64,6 +64,19 @@
 //	                     certd. Defaults to 300 (5 minutes). Cap at
 //	                     certd's user-cert max (24h by default).
 //
+//	SSH_PROXYD_NATS_URL   NATS server URL (e.g., tls://nats:4222) for
+//	                     audit-event publishing. When unset, audit
+//	                     emission is disabled (NoopSink) with a startup
+//	                     warning. Audit events land on subject
+//	                     "ssh.audit.events" in stream "ssh_audit".
+//	SSH_PROXYD_NATS_CERT  Publisher client cert PEM (mTLS to NATS).
+//	SSH_PROXYD_NATS_KEY   Matching private key.
+//	SSH_PROXYD_NATS_CA    CA bundle that signs the NATS server cert.
+//	                     Falls back to SSH_PROXYD_WORKLOAD_CA.
+//	SSH_PROXYD_WORKLOAD_CA  CA PEM used as the fallback CA bundle for
+//	                     NATS verification. One workload CA per
+//	                     deployment is the common case.
+//
 //	SSH_PROXYD_CAST_DIR  Directory where asciinema cast files are
 //	                     written, one per recorded session. When
 //	                     unset, session recording is disabled — the
@@ -87,12 +100,16 @@ import (
 	"syscall"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/journal"
+	"github.com/abagile/tokyo3-base/journal/jetstream"
+	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/google/uuid"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/spf13/cobra"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
@@ -158,6 +175,12 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("recording sink: %w", err)
 	}
 
+	auditSink, err := openAuditSink(log)
+	if err != nil {
+		return fmt.Errorf("audit sink: %w", err)
+	}
+	defer closeIfCloser(auditSink)
+
 	srv, err := pssh.New(pssh.Config{
 		Addr:                  addr,
 		Log:                   log,
@@ -166,6 +189,7 @@ func runServe(ctx context.Context) error {
 		ClientSignerFunc:      signerFunc,
 		TargetHostKeyCallback: hostKeyCB,
 		RecordingSink:         sink,
+		Audit:                 auditSink,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh server: %w", err)
@@ -395,6 +419,59 @@ func loadSSHPrivateKey(path string) (gossh.Signer, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return signer, nil
+}
+
+// envFirst returns the first non-empty env var among keys. Used for
+// fallback chains (e.g. SSH_PROXYD_NATS_CA → SSH_PROXYD_WORKLOAD_CA).
+func envFirst(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// openAuditSink builds the JetStream publisher Sink from
+// SSH_PROXYD_NATS_URL + the CERT/KEY/CA env vars. When the URL is
+// empty, returns [audit.NoopSink] — keeps the dev / no-NATS path
+// working without a broker.
+func openAuditSink(log *slog.Logger) (audit.Sink, error) {
+	url := os.Getenv("SSH_PROXYD_NATS_URL")
+	if url == "" {
+		log.Warn("SSH_PROXYD_NATS_URL not set — audit sink is no-op; not for production")
+		return audit.NoopSink, nil
+	}
+	tlsCfg, err := btls.FromFiles(
+		os.Getenv("SSH_PROXYD_NATS_CERT"),
+		os.Getenv("SSH_PROXYD_NATS_KEY"),
+		envFirst("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("nats audit TLS: %w", err)
+	}
+	if tlsCfg != nil {
+		log.Info("audit sink: NATS JetStream with mTLS", "url", url)
+	} else {
+		log.Warn("audit sink: SSH_PROXYD_NATS_CERT not set — connecting without mTLS (not for production)")
+	}
+	jSink, err := jetstream.NewSink(jetstream.SinkConfig{
+		URL:     url,
+		Subject: audit.Subject,
+		TLS:     tlsCfg,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return journal.NewJSONSink[audit.Entry](jSink), nil
+}
+
+// closeIfCloser invokes Close on resources that implement io.Closer,
+// silently ignoring values that don't (e.g., audit.NoopSink).
+func closeIfCloser(v any) {
+	if c, ok := v.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
 }
 
 // loadRecordingSink returns the asciinema cast sink. When
