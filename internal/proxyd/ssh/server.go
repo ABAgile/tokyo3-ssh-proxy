@@ -26,6 +26,7 @@ import (
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/revcheck"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/routing"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/session"
 )
@@ -73,6 +74,13 @@ type Config struct {
 	// to direct TCP. nil disables tunnel routing entirely (every
 	// session is a direct dial).
 	TunnelRegistry *routing.Registry
+	// Revocations, when non-nil, is consulted on every cert
+	// authentication; certs that match the configured store are
+	// refused at handshake time. nil disables revocation checking
+	// entirely (every otherwise-valid cert is accepted). The proxy
+	// owns no lifecycle — caller starts/stops the underlying
+	// polling loop.
+	Revocations revcheck.Checker
 	// HandshakeTimeout caps the time a single inbound connection
 	// can take to complete the SSH handshake. Defaults to 30s when
 	// zero; prevents slow-loris-style resource exhaustion on the
@@ -444,6 +452,20 @@ func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey)
 	checker := gossh.CertChecker{
 		IsUserAuthority: func(auth gossh.PublicKey) bool {
 			return bytes.Equal(auth.Marshal(), s.cfg.TrustedUserCA.Marshal())
+		},
+		// IsRevoked runs after IsUserAuthority + the cert's own
+		// validity envelope check, so a revoked-but-otherwise-valid
+		// cert lands here with .KeyId / .Serial populated.
+		IsRevoked: func(cert *gossh.Certificate) bool {
+			if s.cfg.Revocations == nil {
+				return false
+			}
+			revoked := s.cfg.Revocations.IsRevoked(cert)
+			if revoked {
+				s.log.Info("user cert refused: revoked",
+					"key_id", cert.KeyId, "serial", cert.Serial)
+			}
+			return revoked
 		},
 	}
 	perms, err := checker.Authenticate(remoteUserMeta{ConnMetadata: meta, user: remoteUser}, key)

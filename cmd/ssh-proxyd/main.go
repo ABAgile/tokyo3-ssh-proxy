@@ -64,6 +64,25 @@
 //	                     certd. Defaults to 300 (5 minutes). Cap at
 //	                     certd's user-cert max (24h by default).
 //
+//	CERTD_REVOCATIONS_URL  certd revocation-snapshot endpoint
+//	                     (e.g., https://certd.internal/api/v1/ssh/revocations).
+//	                     When set, ssh-proxyd polls it every
+//	                     CERTD_REVOCATIONS_POLL_SECONDS (default 30s)
+//	                     and refuses any user cert whose serial or
+//	                     KeyID appears in the snapshot. mTLS material
+//	                     is the same CERTD_MTLS_CERT/_KEY/_CA_BUNDLE
+//	                     the per-session minter already uses.
+//	                     Unset disables revocation checking (revoked
+//	                     certs that are otherwise valid will be
+//	                     accepted).
+//	CERTD_REVOCATIONS_POLL_SECONDS  Polling cadence in seconds.
+//	                     Default 30; the lower bound is the freshness
+//	                     SLA on a freshly-revoked cert. Set high
+//	                     when certd is under heavy load and the TTL
+//	                     of issued certs is short enough that the
+//	                     blast radius of a missed revocation is
+//	                     small.
+//
 //	SSH_PROXYD_NATS_URL   NATS server URL (e.g., tls://nats:4222) for
 //	                     audit-event publishing. When unset, audit
 //	                     emission is disabled (NoopSink) with a startup
@@ -111,6 +130,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/journal"
@@ -125,6 +145,7 @@ import (
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/revcheck"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/routing"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
 )
@@ -203,6 +224,11 @@ func runServe(ctx context.Context) error {
 		defer func() { _ = registry.Close() }()
 	}
 
+	revocationChecker, err := buildRevocationChecker(log)
+	if err != nil {
+		return fmt.Errorf("revocation checker: %w", err)
+	}
+
 	srv, err := pssh.New(pssh.Config{
 		Addr:                  addr,
 		Log:                   log,
@@ -213,6 +239,7 @@ func runServe(ctx context.Context) error {
 		RecordingSink:         sink,
 		Audit:                 auditSink,
 		TunnelRegistry:        registry,
+		Revocations:           revocationChecker,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh server: %w", err)
@@ -220,6 +247,14 @@ func runServe(ctx context.Context) error {
 
 	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	if revocationChecker != nil {
+		go func() {
+			if err := revocationChecker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("revocation poller exited", "err", err)
+			}
+		}()
+	}
 
 	// Run the tunnel listener alongside the SSH server when one is
 	// configured. Either component's exit cancels rootCtx so the
@@ -248,6 +283,50 @@ func runServe(ctx context.Context) error {
 	log.Info("stopped")
 	return nil
 }
+
+// buildRevocationChecker wires the certd revocation poller when
+// CERTD_REVOCATIONS_URL is set. When unset, returns (nil, nil) —
+// pssh.Server's CertChecker.IsRevoked short-circuits to false and
+// the existing handshake behaviour is preserved.
+//
+// TLS material reuses the certd mTLS env vars the per-session
+// minter already understands (CERTD_MTLS_CERT / _KEY / CERTD_CA_BUNDLE)
+// — operators don't need separate keys for the revocations endpoint.
+func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) {
+	url := os.Getenv("CERTD_REVOCATIONS_URL")
+	if url == "" {
+		log.Warn("CERTD_REVOCATIONS_URL unset — revocation checking disabled (revoked certs will still be accepted)")
+		return nil, nil
+	}
+	tlsCfg, err := loadCertdMTLS()
+	if err != nil {
+		return nil, fmt.Errorf("revocation mTLS: %w", err)
+	}
+	period := DefaultRevocationPollInterval
+	if v := os.Getenv("CERTD_REVOCATIONS_POLL_SECONDS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("CERTD_REVOCATIONS_POLL_SECONDS %q: must be positive integer", v)
+		}
+		period = time.Duration(n) * time.Second
+	}
+	checker, err := revcheck.NewPollingChecker(revcheck.Config{
+		URL:          url,
+		TLSConfig:    tlsCfg,
+		PollInterval: period,
+		Log:          log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Info("revocation polling enabled", "url", url, "interval", period)
+	return checker, nil
+}
+
+// DefaultRevocationPollInterval matches revcheck.DefaultPollInterval.
+// Exported here so the env-var doc + the default we surface in logs
+// stay in sync.
+const DefaultRevocationPollInterval = 30 * time.Second
 
 // buildTunnelListener returns the routing.Registry + Listener pair
 // when SSH_PROXYD_TUNNEL_ADDR is configured. When unset, both

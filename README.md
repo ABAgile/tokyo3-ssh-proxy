@@ -75,6 +75,13 @@ internal/
 - **The cert is the authorization token.** ssh-proxyd has no policy DB —
   it enforces what the user cert says (allowed-principals, host-pattern
   extension), which certd embedded at sign time per the role table.
+- **Revocation gating.** When `CERTD_REVOCATIONS_URL` is set, ssh-proxyd
+  polls certd's snapshot every `CERTD_REVOCATIONS_POLL_SECONDS` (default
+  30s) into an in-memory map keyed by serial + KeyID. The SSH server's
+  `gossh.CertChecker.IsRevoked` callback consults the map at every
+  handshake — revoked certs are refused before they reach the channel
+  router. Fetch failures keep the previous snapshot live so a transient
+  certd outage doesn't suddenly admit previously-revoked certs.
 - **ssh-tunneld owns its host identity.** Each tunnel agent renews its
   own SSH host certificate from certd over its existing workload mTLS
   identity (no shared bootstrap key). The fresh cert is written
