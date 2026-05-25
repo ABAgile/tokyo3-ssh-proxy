@@ -269,17 +269,26 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	s.log.Info("target connected",
 		"session_id", ev.sessionID, "target", ev.target, "remote_user", ev.remoteUser)
 
-	// Build the channel proxier with cert-driven RBAC gates and
-	// optional recording. The Proxier produces one asciinema cast
-	// per session channel under the configured RecordingSink.
+	// Build the channel proxier with cert-driven RBAC gates,
+	// optional recording, and the audit context so the recorder can
+	// emit recording.completed events tied to this connection's
+	// SessionID.
 	enforcer := rbac.New(sshConn.Permissions)
 	proxier := session.NewProxier(session.Config{
-		Target:   target,
-		Enforcer: enforcer,
-		Sink:     s.cfg.RecordingSink,
-		User:     ev.user,
-		Host:     ev.target,
-		Log:      s.log,
+		Target:    target,
+		Enforcer:  enforcer,
+		Sink:      s.cfg.RecordingSink,
+		User:      ev.user,
+		Host:      ev.target,
+		Audit:     ev.sink,
+		SessionID: ev.sessionID,
+		AuditAttr: session.RecordingAuditAttr{
+			Principals: ev.principals,
+			Target:     ev.target,
+			RemoteUser: ev.remoteUser,
+			ClientIP:   ev.clientIP,
+		},
+		Log: s.log,
 	})
 	proxier.HandleNewChannels(channels)
 }

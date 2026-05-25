@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
 )
 
@@ -285,6 +288,151 @@ func TestAudit_NoEmissionWhenSinkUnset(t *testing.T) {
 	defer client.Close()
 	sess, _ := client.NewSession()
 	_, _ = sess.Output("anything")
+}
+
+func TestAudit_EmitsRecordingCompletedForPTYSession(t *testing.T) {
+	// PTY-session path: a pty-req fires the recorder, the close
+	// finalises the cast file, and the channelRecorder must publish
+	// a recording.completed entry carrying the cast path + duration.
+	ca := newCA(t)
+	proxyClientSigner := newHostSigner(t)
+	target := newFakeTarget(t, "alice", proxyClientSigner.PublicKey())
+
+	sinkRoot := filepath.Join(t.TempDir(), "casts")
+	recSink, err := recording.NewLocalDirSink(sinkRoot)
+	if err != nil {
+		t.Fatalf("NewLocalDirSink: %v", err)
+	}
+
+	cap := &captureSink{}
+	srv, err := pssh.New(pssh.Config{
+		Addr:                  "127.0.0.1:0",
+		Log:                   silentLogger(),
+		HostSigner:            newHostSigner(t),
+		TrustedUserCA:         ca.pub,
+		ClientSignerFunc:      pssh.StaticSigner(proxyClientSigner),
+		TargetHostKeyCallback: gossh.FixedHostKey(target.hostPub),
+		RecordingSink:         recSink,
+		Audit:                 journal.NewJSONSink[audit.Entry](cap),
+	})
+	if err != nil {
+		t.Fatalf("pssh.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Addr() == "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	userSigner := newUserKey(t)
+	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
+	client, err := dialAsUser(srv.Addr(), "alice@"+target.addr, gossh.PublicKeys(certSigner))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := sess.RequestPty("xterm-256color", 40, 120, gossh.TerminalModes{}); err != nil {
+		t.Fatalf("RequestPty: %v", err)
+	}
+	_, _ = sess.Output("anything")
+	_ = client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	completed := cap.findActions(t, audit.ActionRecordingComplete)
+	if len(completed) != 1 {
+		t.Fatalf("recording.completed entries = %d, want 1", len(completed))
+	}
+	got := completed[0]
+	if got.SessionID == "" {
+		t.Error("recording.completed.SessionID empty")
+	}
+	if got.RecordingPath == "" {
+		t.Error("recording.completed.RecordingPath empty")
+	} else {
+		if _, statErr := os.Stat(got.RecordingPath); statErr != nil {
+			t.Errorf("RecordingPath %q does not exist on disk: %v", got.RecordingPath, statErr)
+		}
+		if !strings.HasPrefix(got.RecordingPath, sinkRoot) {
+			t.Errorf("RecordingPath %q is not under sink root %q", got.RecordingPath, sinkRoot)
+		}
+	}
+	if got.Target != target.addr {
+		t.Errorf("recording.completed.Target = %q, want %q", got.Target, target.addr)
+	}
+	if got.RemoteUser != "alice" {
+		t.Errorf("recording.completed.RemoteUser = %q, want alice", got.RemoteUser)
+	}
+	if got.Metadata == "" {
+		t.Fatal("recording.completed.Metadata empty")
+	}
+	var md map[string]any
+	if err := json.Unmarshal([]byte(got.Metadata), &md); err != nil {
+		t.Fatalf("decode Metadata: %v; raw=%s", err, got.Metadata)
+	}
+	if _, ok := md["duration_seconds"].(float64); !ok {
+		t.Errorf("Metadata missing duration_seconds: %v", md)
+	}
+	if _, ok := md["started_at"]; !ok {
+		t.Errorf("Metadata missing started_at: %v", md)
+	}
+
+	// SessionID must match the session.opened entry so the recording
+	// can be correlated back to the connection.
+	opened := cap.findActions(t, audit.ActionSessionOpened)
+	if len(opened) == 1 && opened[0].SessionID != got.SessionID {
+		t.Errorf("recording.completed.SessionID %q != session.opened.SessionID %q",
+			got.SessionID, opened[0].SessionID)
+	}
+}
+
+func TestAudit_NoRecordingCompletedForNonPTYSession(t *testing.T) {
+	// No pty-req → no cast file → no recording.completed event,
+	// even with both sinks wired up.
+	ca := newCA(t)
+	proxyClientSigner := newHostSigner(t)
+	target := newFakeTarget(t, "alice", proxyClientSigner.PublicKey())
+
+	recSink, _ := recording.NewLocalDirSink(filepath.Join(t.TempDir(), "casts"))
+	cap := &captureSink{}
+	srv, err := pssh.New(pssh.Config{
+		Addr:                  "127.0.0.1:0",
+		Log:                   silentLogger(),
+		HostSigner:            newHostSigner(t),
+		TrustedUserCA:         ca.pub,
+		ClientSignerFunc:      pssh.StaticSigner(proxyClientSigner),
+		TargetHostKeyCallback: gossh.FixedHostKey(target.hostPub),
+		RecordingSink:         recSink,
+		Audit:                 journal.NewJSONSink[audit.Entry](cap),
+	})
+	if err != nil {
+		t.Fatalf("pssh.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.ListenAndServe(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Addr() == "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	userSigner := newUserKey(t)
+	certSigner := signUserCertWithSigner(t, ca, userSigner, []string{"alice"}, time.Time{}, time.Time{})
+	client, _ := dialAsUser(srv.Addr(), "alice@"+target.addr, gossh.PublicKeys(certSigner))
+	defer client.Close()
+	sess, _ := client.NewSession()
+	_, _ = sess.Output("anything")
+	_ = client.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if completed := cap.findActions(t, audit.ActionRecordingComplete); len(completed) != 0 {
+		t.Errorf("non-PTY session produced %d recording.completed entries, want 0", len(completed))
+	}
 }
 
 // Compile-time interface check — fails fast if captureSink drifts

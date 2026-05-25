@@ -66,6 +66,29 @@ internal/
   it enforces what the user cert says (allowed-principals, host-pattern
   extension), which certd embedded at sign time per the role table.
 
+## Audit events
+
+ssh-proxyd publishes per-session events to NATS JetStream on subject
+`ssh.audit.events` (stream `ssh_audit`, retained 400 days). Each event is
+keyed by a per-connection `session_id` so lifecycle and recording events
+can be correlated.
+
+| Action                 | Emitted when                                                  |
+|------------------------|---------------------------------------------------------------|
+| `session.opened`       | After SSH handshake + cert validation succeed.                |
+| `session.closed`       | When the SSH connection ends (success or error).              |
+| `channel.rejected`     | When a channel-open request is denied by RBAC or routing.     |
+| `recording.completed`  | When a PTY session's asciinema cast file has been finalised.  |
+
+`recording.completed` carries the absolute cast path and metadata with
+`duration_seconds` and `started_at`. Audit emission is best-effort —
+failures are logged but never block the wire.
+
+NATS connection is configured via `SSH_PROXYD_NATS_URL`,
+`SSH_PROXYD_NATS_CERT`, `SSH_PROXYD_NATS_KEY`, and
+`SSH_PROXYD_NATS_CA` (falling back to `SSH_PROXYD_WORKLOAD_CA`). When
+unset, audit emission silently degrades to a no-op sink.
+
 ## License
 
 See [LICENSE](LICENSE).

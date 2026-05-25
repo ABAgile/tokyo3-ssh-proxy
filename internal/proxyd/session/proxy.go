@@ -10,6 +10,7 @@ import (
 
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 )
@@ -21,24 +22,45 @@ import (
 // user is allowed to use, and PTY traffic is tee'd into an
 // asciinema cast for audit + replay.
 type Proxier struct {
-	target *gossh.Client
-	rbac   *rbac.CertEnforcer
-	sink   recording.Sink // nil disables recording
-	user   string         // cert KeyID, for cast metadata
-	host   string         // target host, for cast metadata
-	log    *slog.Logger
+	target      *gossh.Client
+	rbac        *rbac.CertEnforcer
+	sink        recording.Sink // nil disables recording
+	user        string         // cert KeyID, for cast metadata
+	host        string         // target host, for cast metadata
+	auditSink   audit.Sink     // for recording.completed events
+	sessionID   string         // matches the SSH server's session ID
+	sessionAttr recordingAuditAttr
+	log         *slog.Logger
 }
 
 // Config bundles the optional knobs for [NewProxier]. Required:
 // Target. Sink + User + Host enable session recording; leaving Sink
-// nil disables it.
+// nil disables it. Audit + SessionID + AuditAttr enable
+// recording.completed audit emission tied back to the SSH server's
+// session lifecycle.
 type Config struct {
-	Target   *gossh.Client
-	Enforcer *rbac.CertEnforcer
-	Sink     recording.Sink
-	User     string
-	Host     string
-	Log      *slog.Logger
+	Target    *gossh.Client
+	Enforcer  *rbac.CertEnforcer
+	Sink      recording.Sink
+	User      string
+	Host      string
+	Audit     audit.Sink
+	SessionID string
+	// AuditAttr carries the optional attribution fields recorded on
+	// the recording.completed event. Empty values produce a
+	// less-attributable Entry; non-empty values mirror what the
+	// SSH server's session.opened event emitted.
+	AuditAttr RecordingAuditAttr
+	Log       *slog.Logger
+}
+
+// RecordingAuditAttr is the public alias for the internal attribution
+// struct so the SSH server can populate fields by name.
+type RecordingAuditAttr struct {
+	Principals string
+	Target     string
+	RemoteUser string
+	ClientIP   string
 }
 
 // NewProxier wraps cfg into a [Proxier]. A nil Enforcer is treated as
@@ -58,12 +80,20 @@ func NewProxier(cfg Config) *Proxier {
 		enforcer = rbac.New(permissivePerms())
 	}
 	return &Proxier{
-		target: cfg.Target,
-		rbac:   enforcer,
-		sink:   cfg.Sink,
-		user:   cfg.User,
-		host:   cfg.Host,
-		log:    log,
+		target:    cfg.Target,
+		rbac:      enforcer,
+		sink:      cfg.Sink,
+		user:      cfg.User,
+		host:      cfg.Host,
+		auditSink: cfg.Audit,
+		sessionID: cfg.SessionID,
+		sessionAttr: recordingAuditAttr{
+			Principals: cfg.AuditAttr.Principals,
+			Target:     cfg.AuditAttr.Target,
+			RemoteUser: cfg.AuditAttr.RemoteUser,
+			ClientIP:   cfg.AuditAttr.ClientIP,
+		},
+		log: log,
 	}
 }
 
@@ -116,7 +146,7 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 	// like are pure transport — no PTY data to capture.
 	var rec *channelRecorder
 	if newCh.ChannelType() == "session" && p.sink != nil {
-		rec = newChannelRecorder(p.sink, p.user, p.host, p.log)
+		rec = newChannelRecorder(p.sink, p.sessionID, p.user, p.host, p.sessionAttr, p.auditSink, p.log)
 		defer rec.Close()
 	}
 

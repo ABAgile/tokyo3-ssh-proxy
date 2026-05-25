@@ -37,7 +37,7 @@ func TestNewLocalDirSink_CreatesRoot(t *testing.T) {
 func TestLocalDirSink_OpenCast_WritesUnderDayDir(t *testing.T) {
 	sink, _ := recording.NewLocalDirSink(t.TempDir())
 	started := time.Date(2026, 5, 25, 14, 30, 0, 0, time.UTC)
-	wc, err := sink.OpenCast(context.Background(), recording.CastMeta{
+	wc, _, err := sink.OpenCast(context.Background(), recording.CastMeta{
 		SessionID: "abc-123",
 		User:      "alice",
 		Target:    "db-1",
@@ -74,7 +74,7 @@ func TestLocalDirSink_OpenCast_WritesUnderDayDir(t *testing.T) {
 
 func TestLocalDirSink_OpenCast_SanitizesSessionID(t *testing.T) {
 	sink, _ := recording.NewLocalDirSink(t.TempDir())
-	wc, err := sink.OpenCast(context.Background(), recording.CastMeta{
+	wc, _, err := sink.OpenCast(context.Background(), recording.CastMeta{
 		SessionID: "../etc/passwd",
 		Started:   time.Now(),
 	})
@@ -93,7 +93,7 @@ func TestLocalDirSink_OpenCast_SanitizesSessionID(t *testing.T) {
 
 func TestLocalDirSink_OpenCast_RejectsMissingSessionID(t *testing.T) {
 	sink, _ := recording.NewLocalDirSink(t.TempDir())
-	_, err := sink.OpenCast(context.Background(), recording.CastMeta{})
+	_, _, err := sink.OpenCast(context.Background(), recording.CastMeta{})
 	if err == nil || !strings.Contains(err.Error(), "SessionID is required") {
 		t.Errorf("err = %v, want 'SessionID is required'", err)
 	}
@@ -105,21 +105,24 @@ func TestLocalDirSink_OpenCast_RejectsDuplicateID(t *testing.T) {
 	// existing audit record.
 	sink, _ := recording.NewLocalDirSink(t.TempDir())
 	meta := recording.CastMeta{SessionID: "dup", Started: time.Now()}
-	wc1, err := sink.OpenCast(context.Background(), meta)
+	wc1, _, err := sink.OpenCast(context.Background(), meta)
 	if err != nil {
 		t.Fatalf("first OpenCast: %v", err)
 	}
 	_ = wc1.Close()
-	_, err = sink.OpenCast(context.Background(), meta)
+	_, _, err = sink.OpenCast(context.Background(), meta)
 	if err == nil {
 		t.Fatal("second OpenCast with same SessionID/day succeeded; want O_EXCL refusal")
 	}
 }
 
 func TestNopSink_DiscardsWrites(t *testing.T) {
-	wc, err := (recording.NopSink{}).OpenCast(context.Background(), recording.CastMeta{SessionID: "x"})
+	wc, loc, err := (recording.NopSink{}).OpenCast(context.Background(), recording.CastMeta{SessionID: "x"})
 	if err != nil {
 		t.Fatalf("OpenCast: %v", err)
+	}
+	if loc != "" {
+		t.Errorf("NopSink location = %q, want empty", loc)
 	}
 	if _, err := io.WriteString(wc, "ignored"); err != nil {
 		t.Errorf("write: %v", err)

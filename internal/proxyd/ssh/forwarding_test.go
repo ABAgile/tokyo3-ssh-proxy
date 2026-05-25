@@ -146,6 +146,15 @@ func (ft *fakeTarget) serveConn(conn net.Conn, cfg *gossh.ServerConfig) {
 					// SSH "exit-status" request: uint32 exit code.
 					_, _ = ch.SendRequest("exit-status", false, gossh.Marshal(struct{ Status uint32 }{0}))
 					_ = ch.CloseWrite()
+					// Small drain pause before the full close. gossh
+					// occasionally races a CHANNEL_CLOSE on the
+					// outbound side against the inbound data
+					// forwarding goroutine — a real sshd doesn't hit
+					// this because it does its own teardown signaling
+					// around the exit-status. A few milliseconds let
+					// the proxy's target→user io.Copy drain the
+					// buffered echo before the channel is torn down.
+					time.Sleep(10 * time.Millisecond)
 					_ = ch.Close()
 				}
 			}

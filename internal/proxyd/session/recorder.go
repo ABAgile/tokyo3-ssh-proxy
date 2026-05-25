@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 )
 
@@ -23,31 +25,54 @@ import (
 // goroutine and writeOutput (via [recordingTee.Write]) from the
 // data-copy goroutine.
 type channelRecorder struct {
-	sink recording.Sink
-	user string
-	host string
-	log  *slog.Logger
+	sink        recording.Sink
+	user        string
+	host        string
+	log         *slog.Logger
+	audit       audit.Sink
+	sessionAttr recordingAuditAttr
 
 	mu        sync.Mutex
 	rec       *recording.Recorder
 	cast      io.WriteCloser
+	location  string
 	sessionID string
 	startedAt time.Time
 	closed    bool
 }
 
+// recordingAuditAttr carries the connection-level attribution
+// channelRecorder needs to emit recording.completed events into the
+// shared audit stream. Empty values are tolerated — they just produce
+// a less-attributable Entry.
+type recordingAuditAttr struct {
+	Principals string
+	Target     string
+	RemoteUser string
+	ClientIP   string
+}
+
 // newChannelRecorder builds a recorder bound to sink. Lazy
 // initialisation means the cast file is only opened when a pty-req
 // arrives (so non-PTY exec sessions don't litter the cast directory).
-func newChannelRecorder(sink recording.Sink, user, host string, log *slog.Logger) *channelRecorder {
+// auditSink is nil-safe; pass [audit.NoopSink] when audit is disabled.
+// sessionID ties the recording's audit events back to the same
+// SessionID the SSH server stamped on session.opened / .closed.
+func newChannelRecorder(sink recording.Sink, sessionID, user, host string, attr recordingAuditAttr, auditSink audit.Sink, log *slog.Logger) *channelRecorder {
 	if log == nil {
 		log = slog.Default()
 	}
+	if auditSink == nil {
+		auditSink = audit.NoopSink
+	}
 	return &channelRecorder{
-		sink: sink,
-		user: user,
-		host: host,
-		log:  log,
+		sink:        sink,
+		user:        user,
+		host:        host,
+		log:         log,
+		audit:       auditSink,
+		sessionAttr: attr,
+		sessionID:   sessionID,
 	}
 }
 
@@ -61,9 +86,13 @@ func (r *channelRecorder) StartIfNeeded(width, height int) error {
 	if r.rec != nil || r.closed {
 		return nil
 	}
-	r.sessionID = uuid.NewString()
+	if r.sessionID == "" {
+		// Fall back to a fresh UUID when the SSH server didn't seed
+		// one — keeps the dev path working when audit is unwired.
+		r.sessionID = uuid.NewString()
+	}
 	r.startedAt = time.Now().UTC()
-	cast, err := r.sink.OpenCast(context.Background(), recording.CastMeta{
+	cast, location, err := r.sink.OpenCast(context.Background(), recording.CastMeta{
 		SessionID: r.sessionID,
 		User:      r.user,
 		Target:    r.host,
@@ -80,10 +109,12 @@ func (r *channelRecorder) StartIfNeeded(width, height int) error {
 	}
 	r.cast = cast
 	r.rec = rec
+	r.location = location
 	r.log.Info("session recording started",
 		"session_id", r.sessionID,
 		"user", r.user, "target", r.host,
 		"width", width, "height", height,
+		"location", location,
 	)
 	return nil
 }
@@ -112,7 +143,9 @@ func (r *channelRecorder) Resize(width, height int) {
 	rec.Resize(width, height)
 }
 
-// Close finalises the underlying cast file. Idempotent.
+// Close finalises the underlying cast file and emits a
+// recording.completed audit event when a recording was actually
+// produced (i.e., a pty-req fired). Idempotent.
 func (r *channelRecorder) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -120,21 +153,64 @@ func (r *channelRecorder) Close() error {
 		return nil
 	}
 	r.closed = true
+	hadRecording := r.rec != nil
 	if r.rec != nil {
 		_ = r.rec.Close()
 	}
+	var closeErr error
 	if r.cast != nil {
-		err := r.cast.Close()
-		r.cast = nil
-		r.rec = nil
-		if err != nil {
-			r.log.Warn("close cast file", "session_id", r.sessionID, "err", err)
+		closeErr = r.cast.Close()
+		if closeErr != nil {
+			r.log.Warn("close cast file", "session_id", r.sessionID, "err", closeErr)
 		} else {
-			r.log.Info("session recording closed", "session_id", r.sessionID)
+			r.log.Info("session recording closed", "session_id", r.sessionID, "location", r.location)
 		}
-		return err
 	}
-	return nil
+	if hadRecording {
+		r.emitCompleted()
+	}
+	r.cast = nil
+	r.rec = nil
+	return closeErr
+}
+
+// emitCompleted publishes the recording.completed audit Entry. Run
+// only when a real recording was produced (lazy-start path fired);
+// no-PTY sessions skip both the cast file and the audit event.
+func (r *channelRecorder) emitCompleted() {
+	duration := time.Since(r.startedAt).Seconds()
+	if duration < 0 {
+		duration = 0
+	}
+	metadata := map[string]any{
+		"duration_seconds": round6(duration),
+		"started_at":       r.startedAt.UTC(),
+	}
+	md, _ := json.Marshal(metadata)
+	entry := audit.Entry{
+		ID:            uuid.NewString(),
+		Action:        audit.ActionRecordingComplete,
+		SessionID:     r.sessionID,
+		User:          r.user,
+		Principals:    r.sessionAttr.Principals,
+		Target:        r.sessionAttr.Target,
+		RemoteUser:    r.sessionAttr.RemoteUser,
+		ClientIP:      r.sessionAttr.ClientIP,
+		RecordingPath: r.location,
+		Metadata:      string(md),
+		OccurredAt:    time.Now().UTC(),
+	}
+	if err := r.audit.Append(context.Background(), entry); err != nil {
+		r.log.Warn("audit recording.completed append failed", "session_id", r.sessionID, "err", err)
+	}
+}
+
+// round6 trims a duration value to ~microsecond precision for the
+// audit metadata. Matches the trimming the asciinema recorder
+// applies to event timestamps.
+func round6(v float64) float64 {
+	const mult = 1e6
+	return float64(int64(v*mult+0.5)) / mult
 }
 
 // recordingTee wraps an [io.Writer] and also feeds each chunk into a

@@ -17,11 +17,14 @@ import (
 // [LocalDirSink] is the in-process fallback for dev / first run.
 //
 // OpenCast returns an io.WriteCloser the [Recorder] streams events
-// to. Calling Close on the writer finalises the cast — for file
-// sinks that means fsync + chmod; for object stores it means
-// uploading the buffered bytes.
+// to plus a string location identifying where the cast lives so
+// audit / the portal can find it later. For file sinks the location
+// is an absolute path; for object stores it would be a URL.
+// Calling Close on the writer finalises the cast — for file sinks
+// that means fsync + chmod; for object stores it means uploading
+// the buffered bytes.
 type Sink interface {
-	OpenCast(ctx context.Context, meta CastMeta) (io.WriteCloser, error)
+	OpenCast(ctx context.Context, meta CastMeta) (out io.WriteCloser, location string, err error)
 }
 
 // CastMeta describes one recording so a Sink can name + locate it.
@@ -72,10 +75,11 @@ func (s *LocalDirSink) Root() string { return s.root }
 // OpenCast satisfies [Sink]. Builds the day subdirectory on first
 // touch, then opens <root>/<date>/<session-id>.cast for writing.
 // The returned writer is created with 0600 (audit data — the
-// operator decides who reads it).
-func (s *LocalDirSink) OpenCast(_ context.Context, meta CastMeta) (io.WriteCloser, error) {
+// operator decides who reads it). The returned location is the
+// absolute file path.
+func (s *LocalDirSink) OpenCast(_ context.Context, meta CastMeta) (io.WriteCloser, string, error) {
 	if meta.SessionID == "" {
-		return nil, errors.New("CastMeta.SessionID is required")
+		return nil, "", errors.New("CastMeta.SessionID is required")
 	}
 	if meta.Started.IsZero() {
 		meta.Started = time.Now()
@@ -85,16 +89,16 @@ func (s *LocalDirSink) OpenCast(_ context.Context, meta CastMeta) (io.WriteClose
 	s.mu.Lock()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
+		return nil, "", fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	s.mu.Unlock()
 
 	path := filepath.Join(dir, sanitizeFilename(meta.SessionID)+".cast")
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("create %s: %w", path, err)
+		return nil, "", fmt.Errorf("create %s: %w", path, err)
 	}
-	return f, nil
+	return f, path, nil
 }
 
 // sanitizeFilename strips path separators + control chars from
@@ -124,9 +128,10 @@ func sanitizeFilename(id string) string {
 // the Proxier with recording wired but don't care about the bytes.
 type NopSink struct{}
 
-// OpenCast satisfies [Sink]. Returns a writer that discards everything.
-func (NopSink) OpenCast(context.Context, CastMeta) (io.WriteCloser, error) {
-	return nopWriteCloser{}, nil
+// OpenCast satisfies [Sink]. Returns a writer that discards
+// everything and an empty location (no on-disk artefact to point at).
+func (NopSink) OpenCast(context.Context, CastMeta) (io.WriteCloser, string, error) {
+	return nopWriteCloser{}, "", nil
 }
 
 type nopWriteCloser struct{}
