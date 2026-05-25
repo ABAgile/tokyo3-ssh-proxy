@@ -18,6 +18,17 @@ const DefaultTargetPort = "22"
 // the TCP connect and the SSH handshake to complete.
 const DefaultDialTimeout = 15 * time.Second
 
+// Transport produces the raw [net.Conn] that the SSH handshake will
+// run on top of. The default (nil Transport) is a TCP dial via
+// [net.Dialer]; ssh-proxyd injects a routing-registry-backed
+// transport in production so traffic flows over an existing yamux
+// tunnel when one is registered for the host.
+//
+// Implementations should honour ctx for cancellation and surface
+// transport-level errors verbatim — DialTarget wraps them with the
+// "dial <addr>" prefix.
+type Transport func(ctx context.Context, addr string) (net.Conn, error)
+
 // DialConfig configures a [DialTarget] call.
 type DialConfig struct {
 	// Address is the target's host or host:port. When the port is
@@ -38,6 +49,11 @@ type DialConfig struct {
 	// Timeout caps the time the dial may take. Zero uses
 	// [DefaultDialTimeout].
 	Timeout time.Duration
+	// Transport optionally overrides the raw connection acquisition.
+	// Nil ⇒ a direct TCP dial. The proxy passes a routing-registry-
+	// backed transport here so tunneled hosts get an existing yamux
+	// stream instead of a fresh TCP connection.
+	Transport Transport
 }
 
 // DialTarget opens an outbound SSH client connection to cfg.Address
@@ -73,8 +89,16 @@ func DialTarget(ctx context.Context, cfg DialConfig) (*gossh.Client, error) {
 		addr = net.JoinHostPort(addr, DefaultTargetPort)
 	}
 
-	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	transport := cfg.Transport
+	if transport == nil {
+		transport = func(ctx context.Context, target string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: timeout}
+			return dialer.DialContext(ctx, "tcp", target)
+		}
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := transport(dialCtx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

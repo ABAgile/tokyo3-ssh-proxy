@@ -87,6 +87,14 @@ internal/
   stream, and pipes bytes both ways. A failed dial closes only that
   stream — the session keeps serving subsequent streams, so an sshd
   restart doesn't take the whole tunnel down.
+- **Routing decisions are credential-driven, not topology-driven.**
+  ssh-proxyd holds a `routing.Registry` (case-folded host label →
+  live yamux session). `session.DialTarget` accepts a pluggable
+  `Transport` hook so the proxy substitutes a `registry.Open`-backed
+  dial for tunneled hosts while keeping direct TCP for everything
+  else. A dead session (yamux `IsClosed`) is scrubbed lazily on the
+  next lookup so a flaky agent doesn't strand stale tunnels in the
+  registry.
 
 ## Audit events
 
