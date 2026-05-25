@@ -139,6 +139,13 @@ NATS connection is configured via `SSH_PROXYD_NATS_URL`,
 `SSH_PROXYD_NATS_CA` (falling back to `SSH_PROXYD_WORKLOAD_CA`). When
 unset, audit emission silently degrades to a no-op sink.
 
+## Security
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for the per-surface threat
+inventory + mitigations. Reviewers should walk the document's
+checklist when auditing changes that touch the SSH handshake path,
+channel proxying, the tunnel listener, or audit emissions.
+
 ## License
 
 See [LICENSE](LICENSE).
