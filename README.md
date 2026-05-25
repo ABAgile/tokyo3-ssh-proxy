@@ -81,6 +81,12 @@ internal/
   dialer reconnects with exponential backoff (1s → 30s, ±20% jitter)
   on session loss and surfaces the live session to a caller-supplied
   `SessionHandler` for stream forwarding.
+- **Per-stream forwarding to local sshd.** `internal/tunneld/forward`
+  is the canonical `SessionHandler`: it loops on `AcceptStream`,
+  dials the configured local addr (default `127.0.0.1:22`) for each
+  stream, and pipes bytes both ways. A failed dial closes only that
+  stream — the session keeps serving subsequent streams, so an sshd
+  restart doesn't take the whole tunnel down.
 
 ## Audit events
 
