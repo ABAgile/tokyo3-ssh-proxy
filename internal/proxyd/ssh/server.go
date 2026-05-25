@@ -26,6 +26,7 @@ import (
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/rbac"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/routing"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/session"
 )
 
@@ -65,6 +66,13 @@ type Config struct {
 	// rejection events. When nil, [audit.NoopSink] is used (events
 	// are discarded silently).
 	Audit audit.Sink
+	// TunnelRegistry, when non-nil, is consulted before each target
+	// dial. When the target host is registered (an ssh-tunneld has an
+	// active session for it), the proxy routes the user session over
+	// that yamux tunnel as a new stream. Unregistered hosts fall back
+	// to direct TCP. nil disables tunnel routing entirely (every
+	// session is a direct dial).
+	TunnelRegistry *routing.Registry
 	// HandshakeTimeout caps the time a single inbound connection
 	// can take to complete the SSH handshake. Defaults to 30s when
 	// zero; prevents slow-loris-style resource exhaustion on the
@@ -249,12 +257,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// Dial the target sshd. The handshake timeout doesn't apply
-	// here — DialTarget has its own.
+	// here — DialTarget has its own. When a tunnel is registered for
+	// the host, the Transport hook routes the dial over the existing
+	// yamux session; otherwise DialTarget falls back to a direct TCP
+	// connect.
 	target, err := session.DialTarget(ctx, session.DialConfig{
 		Address:         ev.target,
 		User:            ev.remoteUser,
 		Signer:          signer,
 		HostKeyCallback: s.cfg.TargetHostKeyCallback,
+		Transport:       s.tunnelTransport(ev.target),
 	})
 	if err != nil {
 		reason := fmt.Sprintf("target unreachable: %v", err)
@@ -301,6 +313,42 @@ func (s *Server) audit() audit.Sink {
 		return audit.NoopSink
 	}
 	return s.cfg.Audit
+}
+
+// tunnelTransport returns the session.Transport hook for a given
+// target host. When no registry is configured the result is nil
+// (DialTarget falls back to direct TCP). When the registry is
+// configured but the host isn't registered, the transport still
+// surfaces ErrNoTunnel as a fallback by dialing TCP — operators can
+// run tunneled hosts alongside direct-connect hosts without
+// per-target config.
+func (s *Server) tunnelTransport(host string) session.Transport {
+	if s.cfg.TunnelRegistry == nil {
+		return nil
+	}
+	registry := s.cfg.TunnelRegistry
+	// host is "<addr>:<port>" — strip the port for the registry
+	// lookup; tunnel registrations key off the hostname only.
+	lookupHost := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		lookupHost = h
+	}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := registry.Open(ctx, lookupHost)
+		if err == nil {
+			s.log.Debug("dialing target via tunnel",
+				"host", lookupHost, "addr", addr)
+			return conn, nil
+		}
+		if !errors.Is(err, routing.ErrNoTunnel) {
+			return nil, err
+		}
+		// No tunnel for this host — fall back to a direct TCP dial.
+		s.log.Debug("no tunnel registered; dialing target directly",
+			"host", lookupHost, "addr", addr)
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
 }
 
 // sessionEvents bundles the per-connection attribution shared by

@@ -82,6 +82,19 @@
 //	                     unset, session recording is disabled — the
 //	                     proxy still forwards traffic but produces
 //	                     no audit cast files.
+//
+//	SSH_PROXYD_TUNNEL_ADDR  Listen address for inbound mTLS+yamux
+//	                     tunnels from ssh-tunneld instances (e.g.,
+//	                     ":2223"). Unset disables tunnel acceptance —
+//	                     every target dial goes direct TCP.
+//	SSH_PROXYD_TUNNEL_TLS_CERT  Proxy server cert PEM presented to
+//	                     tunneld agents on the tunnel listener.
+//	                     Required iff SSH_PROXYD_TUNNEL_ADDR is set.
+//	SSH_PROXYD_TUNNEL_TLS_KEY   Matching private key.
+//	SSH_PROXYD_TUNNEL_CLIENT_CA CA bundle that signs ssh-tunneld
+//	                     workload client certs (used to verify each
+//	                     inbound tunnel). Falls back to
+//	                     SSH_PROXYD_WORKLOAD_CA.
 package main
 
 import (
@@ -112,6 +125,7 @@ import (
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/routing"
 	pssh "github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/ssh"
 )
 
@@ -181,6 +195,14 @@ func runServe(ctx context.Context) error {
 	}
 	defer closeIfCloser(auditSink)
 
+	registry, tunnelListener, err := buildTunnelListener(log)
+	if err != nil {
+		return fmt.Errorf("tunnel listener: %w", err)
+	}
+	if registry != nil {
+		defer func() { _ = registry.Close() }()
+	}
+
 	srv, err := pssh.New(pssh.Config{
 		Addr:                  addr,
 		Log:                   log,
@@ -190,6 +212,7 @@ func runServe(ctx context.Context) error {
 		TargetHostKeyCallback: hostKeyCB,
 		RecordingSink:         sink,
 		Audit:                 auditSink,
+		TunnelRegistry:        registry,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh server: %w", err)
@@ -198,11 +221,81 @@ func runServe(ctx context.Context) error {
 	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := srv.ListenAndServe(rootCtx); err != nil {
-		return fmt.Errorf("serve: %w", err)
+	// Run the tunnel listener alongside the SSH server when one is
+	// configured. Either component's exit cancels rootCtx so the
+	// other unwinds cleanly.
+	errCh := make(chan error, 2)
+	if tunnelListener != nil {
+		go func() { errCh <- tunnelListener.ListenAndServe(rootCtx) }()
+	}
+	go func() { errCh <- srv.ListenAndServe(rootCtx) }()
+
+	expected := 1
+	if tunnelListener != nil {
+		expected = 2
+	}
+	var firstErr error
+	for i := 0; i < expected; i++ {
+		err := <-errCh
+		if firstErr == nil && err != nil && !errors.Is(err, context.Canceled) {
+			firstErr = err
+		}
+		cancel() // bring the other component down
+	}
+	if firstErr != nil {
+		return fmt.Errorf("serve: %w", firstErr)
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// buildTunnelListener returns the routing.Registry + Listener pair
+// when SSH_PROXYD_TUNNEL_ADDR is configured. When unset, both
+// returns are nil — the proxy serves only direct-TCP target dials.
+func buildTunnelListener(log *slog.Logger) (*routing.Registry, *routing.Listener, error) {
+	addr := os.Getenv("SSH_PROXYD_TUNNEL_ADDR")
+	if addr == "" {
+		log.Warn("SSH_PROXYD_TUNNEL_ADDR unset — tunnel acceptance disabled; all sessions use direct TCP")
+		return nil, nil, nil
+	}
+	certFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_CERT")
+	keyFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_KEY")
+	caFile := envFirst("SSH_PROXYD_TUNNEL_CLIENT_CA", "SSH_PROXYD_WORKLOAD_CA")
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return nil, nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
+	}
+
+	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load tunnel server cert: %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read tunnel client CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, nil, fmt.Errorf("tunnel client CA %s contains no PEM certs", caFile)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{keyPair},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	registry := routing.New()
+	listener, err := routing.NewListener(routing.ListenerConfig{
+		Addr:      addr,
+		TLSConfig: tlsCfg,
+		Registry:  registry,
+		Log:       log,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Info("tunnel listener configured", "addr", addr)
+	return registry, listener, nil
 }
 
 func versionCmd() *cobra.Command {

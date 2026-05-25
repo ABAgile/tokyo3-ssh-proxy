@@ -15,8 +15,18 @@ This repo ships two binaries:
 
 ## Status
 
-**Scaffold only.** Binaries compile and respond to `version` / `--help` but
-`ssh-proxyd serve` and `ssh-tunneld run` subcommands are not yet implemented.
+**MVP wired end-to-end.** `ssh-proxyd serve` is a full SSH gateway with
+cert-based user auth, per-session cert minting from certd, asciinema
+recording, audit emission, and (optional) inbound tunnel acceptance.
+`ssh-tunneld run` is a full reverse-tunnel agent: holds an outbound
+mTLS+yamux session to ssh-proxyd, forwards inbound streams to local
+sshd, and renews its host SSH cert when configured.
+
+See the `go doc` comments in `cmd/ssh-proxyd/main.go` and
+`cmd/ssh-tunneld/main.go` for the full env-var matrix. The
+`SSH_PROXYD_TUNNEL_*` and `SSH_TUNNELD_*` variables wire the
+reverse-tunnel path; without them the proxy still works in
+direct-TCP mode.
 
 ## Requirements
 
