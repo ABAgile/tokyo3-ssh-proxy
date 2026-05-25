@@ -141,18 +141,14 @@ func runAgent(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		errCh <- dialer.Run(rootCtx)
-	}()
+	})
 
 	if renewer != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errCh <- renewer.Run(rootCtx)
-		}()
+		})
 	}
 
 	// Wait for first component exit; cancel to bring the other down.
@@ -283,7 +279,7 @@ func buildHostCertRenewer(log *slog.Logger, workloadTLS *tls.Config) (*hostcert.
 	principals := []string{hostname}
 	if raw := os.Getenv("SSH_TUNNELD_HOST_PRINCIPALS"); raw != "" {
 		principals = principals[:0]
-		for _, p := range strings.Split(raw, ",") {
+		for p := range strings.SplitSeq(raw, ",") {
 			if p = strings.TrimSpace(p); p != "" {
 				principals = append(principals, p)
 			}

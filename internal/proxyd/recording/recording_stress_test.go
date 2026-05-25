@@ -154,7 +154,7 @@ func TestStress_AlternateScreenBufferTransitions(t *testing.T) {
 	if len(events) != cycles*4 {
 		t.Fatalf("event count = %d, want %d", len(events), cycles*4)
 	}
-	for i := 0; i < cycles; i++ {
+	for i := range cycles {
 		base := i * 4
 		if events[base].Payload != "\x1b[?1049h" {
 			t.Errorf("cycle %d: enter event mismatch", i)
@@ -262,7 +262,7 @@ func TestStress_ConcurrentOutputAndResize(t *testing.T) {
 	const writers = 8
 	const eventsPerWriter = 100
 	wg.Add(writers)
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		go func(id int) {
 			defer wg.Done()
 			payload := []byte("from-writer-" + string(rune('0'+id)) + "\n")
@@ -271,13 +271,11 @@ func TestStress_ConcurrentOutputAndResize(t *testing.T) {
 			}
 		}(w)
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < eventsPerWriter; i++ {
+	wg.Go(func() {
+		for i := range eventsPerWriter {
 			rec.Resize(80+i%10, 24+i%5)
 		}
-	}()
+	})
 	wg.Wait()
 	_ = rec.Close()
 

@@ -46,7 +46,7 @@ func writeHostPrivateKey(t *testing.T, path string) []byte {
 // stubSigner is the [hostcert.Signer] test double.
 type stubSigner struct {
 	mu        sync.Mutex
-	calls     int32
+	calls     atomic.Int32
 	gotReq    certclient.SignHostRequest
 	respFn    func(certclient.SignHostRequest) (*certclient.SignHostResponse, error)
 	respondCh chan struct{} // optional: release one response per signal
@@ -54,7 +54,7 @@ type stubSigner struct {
 
 func (s *stubSigner) SignHostCert(_ context.Context, req certclient.SignHostRequest) (*certclient.SignHostResponse, error) {
 	s.mu.Lock()
-	atomic.AddInt32(&s.calls, 1)
+	s.calls.Add(1)
 	s.gotReq = req
 	fn := s.respFn
 	s.mu.Unlock()
@@ -253,7 +253,7 @@ func TestRenewer_Run_LoopsAndRenews(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if got := atomic.LoadInt32(&signer.calls); got < 2 {
+	if got := signer.calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want at least 2 (initial sign + at least one renew)", got)
 	}
 }
@@ -264,9 +264,9 @@ func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	writeHostPrivateKey(t, hostKeyPath)
 	certPath := filepath.Join(dir, "k-cert.pub")
 
-	var calls int32
+	var calls atomic.Int32
 	signer := &stubSigner{respFn: func(_ certclient.SignHostRequest) (*certclient.SignHostResponse, error) {
-		if atomic.AddInt32(&calls, 1) == 1 {
+		if calls.Add(1) == 1 {
 			return nil, errors.New("transient certd outage")
 		}
 		now := time.Now().UTC()
@@ -291,7 +291,7 @@ func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if got := atomic.LoadInt32(&calls); got < 2 {
+	if got := calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want ≥ 2 (failure + retry)", got)
 	}
 	body, err := os.ReadFile(certPath)
@@ -339,7 +339,7 @@ func TestRenewer_nextRenewalDelay_RespectsFraction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_ = r.Run(ctx)
-	if got := atomic.LoadInt32(&signer.calls); got != 1 {
+	if got := signer.calls.Load(); got != 1 {
 		t.Errorf("calls = %d, want exactly 1 (initial sign; renewal is 6h away)", got)
 	}
 }

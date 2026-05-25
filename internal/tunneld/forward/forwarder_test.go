@@ -187,8 +187,8 @@ func TestForwarder_Handle_ServesConcurrentStreams(t *testing.T) {
 	const n = 6
 	var wg sync.WaitGroup
 	wg.Add(n)
-	var success int32
-	for i := 0; i < n; i++ {
+	var success atomic.Int32
+	for i := range n {
 		go func(id int) {
 			defer wg.Done()
 			s, err := proxy.Open()
@@ -210,14 +210,14 @@ func TestForwarder_Handle_ServesConcurrentStreams(t *testing.T) {
 				return
 			}
 			if got := string(buf[:r]); got == "echo:p" {
-				atomic.AddInt32(&success, 1)
+				success.Add(1)
 			} else {
 				t.Errorf("stream %d got %q, want %q", id, got, "echo:p")
 			}
 		}(i)
 	}
 	wg.Wait()
-	if got := atomic.LoadInt32(&success); got != n {
+	if got := success.Load(); got != n {
 		t.Errorf("success = %d, want %d", got, n)
 	}
 	cancel()

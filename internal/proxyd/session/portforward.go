@@ -47,8 +47,8 @@ func parseDirectTCPIPRequest(extra []byte) (directTCPIPRequest, error) {
 // and the counters are atomic.
 type countingChannel struct {
 	gossh.Channel
-	bytesRead    int64 // bytes the proxy read from this channel
-	bytesWritten int64 // bytes the proxy wrote to this channel
+	bytesRead    atomic.Int64 // bytes the proxy read from this channel
+	bytesWritten atomic.Int64 // bytes the proxy wrote to this channel
 }
 
 // Read satisfies [io.Reader] on the wrapped channel and updates the
@@ -56,7 +56,7 @@ type countingChannel struct {
 func (c *countingChannel) Read(p []byte) (int, error) {
 	n, err := c.Channel.Read(p)
 	if n > 0 {
-		atomic.AddInt64(&c.bytesRead, int64(n))
+		c.bytesRead.Add(int64(n))
 	}
 	return n, err
 }
@@ -66,7 +66,7 @@ func (c *countingChannel) Read(p []byte) (int, error) {
 func (c *countingChannel) Write(p []byte) (int, error) {
 	n, err := c.Channel.Write(p)
 	if n > 0 {
-		atomic.AddInt64(&c.bytesWritten, int64(n))
+		c.bytesWritten.Add(int64(n))
 	}
 	return n, err
 }

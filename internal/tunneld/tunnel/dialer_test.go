@@ -87,9 +87,7 @@ func newFakeProxy(t *testing.T, srvTLS *tls.Config) *fakeProxy {
 	}
 	var wg sync.WaitGroup
 	stopCh := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -115,7 +113,7 @@ func newFakeProxy(t *testing.T, srvTLS *tls.Config) *fakeProxy {
 				}
 			}(conn)
 		}
-	}()
+	})
 	fp.stop = func() {
 		close(stopCh)
 		_ = ln.Close()
@@ -254,7 +252,7 @@ func TestDialer_Run_RetriesAfterDialFailure(t *testing.T) {
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	var calls int32
+	var calls atomic.Int32
 	d, _ := tunnel.New(tunnel.Config{
 		Target:         addr,
 		TLSConfig:      clientTLS,
@@ -263,7 +261,7 @@ func TestDialer_Run_RetriesAfterDialFailure(t *testing.T) {
 		MaxBackoff:     40 * time.Millisecond,
 		BackoffJitter:  0, // deterministic schedule
 		Handler: func(ctx context.Context, s *yamux.Session) error {
-			atomic.AddInt32(&calls, 1)
+			calls.Add(1)
 			<-ctx.Done()
 			return ctx.Err()
 		},
@@ -304,12 +302,12 @@ func TestDialer_Run_RetriesAfterDialFailure(t *testing.T) {
 	// Expect the handler to fire within a few backoff windows.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&calls) > 0 {
+		if calls.Load() > 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if atomic.LoadInt32(&calls) == 0 {
+	if calls.Load() == 0 {
 		t.Error("handler never invoked after recovery")
 	}
 
@@ -321,7 +319,7 @@ func TestDialer_Run_ReconnectsAfterHandlerReturn(t *testing.T) {
 	clientTLS, serverTLS := mintTLS(t)
 	fp := newFakeProxy(t, serverTLS)
 
-	var calls int32
+	var calls atomic.Int32
 	d, _ := tunnel.New(tunnel.Config{
 		Target:         fp.addr,
 		TLSConfig:      clientTLS,
@@ -329,7 +327,7 @@ func TestDialer_Run_ReconnectsAfterHandlerReturn(t *testing.T) {
 		MaxBackoff:     20 * time.Millisecond,
 		BackoffJitter:  0,
 		Handler: func(_ context.Context, _ *yamux.Session) error {
-			atomic.AddInt32(&calls, 1)
+			calls.Add(1)
 			return errors.New("forcing reconnect")
 		},
 	})
@@ -338,7 +336,7 @@ func TestDialer_Run_ReconnectsAfterHandlerReturn(t *testing.T) {
 	defer cancel()
 	_ = d.Run(ctx)
 
-	if got := atomic.LoadInt32(&calls); got < 2 {
+	if got := calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want at least 2 (initial + at least 1 reconnect)", got)
 	}
 }

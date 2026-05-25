@@ -221,8 +221,7 @@ func TestAudit_EmitsChannelRejectedOnSignerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = srv.ListenAndServe(ctx) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == "" && time.Now().Before(deadline) {
@@ -271,8 +270,7 @@ func TestAudit_NoEmissionWhenSinkUnset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = srv.ListenAndServe(ctx) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == "" && time.Now().Before(deadline) {
@@ -319,8 +317,7 @@ func TestAudit_EmitsRecordingCompletedForPTYSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe(ctx) }()
 	deadline := time.Now().Add(2 * time.Second)
@@ -414,8 +411,7 @@ func TestAudit_NoRecordingCompletedForNonPTYSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = srv.ListenAndServe(ctx) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == "" && time.Now().Before(deadline) {

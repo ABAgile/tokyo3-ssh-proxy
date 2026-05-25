@@ -212,8 +212,7 @@ func TestServer_MintsPerSessionCertViaCertd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe(ctx) }()
 
@@ -270,8 +269,7 @@ func TestServer_PropagatesCertdMintingErrors(t *testing.T) {
 		ClientSignerFunc:      signerFn,
 		TargetHostKeyCallback: gossh.FixedHostKey(target.hostPub),
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = srv.ListenAndServe(ctx) }()
 
 	deadline := time.Now().Add(2 * time.Second)

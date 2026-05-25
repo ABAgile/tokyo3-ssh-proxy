@@ -30,8 +30,7 @@ func BenchmarkEntryAppend_Noop(b *testing.B) {
 		OccurredAt:    time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC),
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = sink.Append(context.Background(), entry)
 	}
 }
@@ -53,8 +52,7 @@ func BenchmarkEntryAppend_DiscardSink(b *testing.B) {
 		OccurredAt: time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC),
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = sink.Append(context.Background(), entry)
 	}
 }

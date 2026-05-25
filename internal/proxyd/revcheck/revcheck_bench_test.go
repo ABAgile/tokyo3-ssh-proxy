@@ -14,8 +14,7 @@ func BenchmarkIsRevoked_Hit(b *testing.B) {
 	p := newWithEntries(1000)
 	cert := &gossh.Certificate{Serial: 500}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = p.IsRevoked(cert)
 	}
 }
@@ -26,8 +25,7 @@ func BenchmarkIsRevoked_Miss(b *testing.B) {
 	p := newWithEntries(1000)
 	cert := &gossh.Certificate{Serial: 99_999_999, KeyId: "user:never-revoked"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = p.IsRevoked(cert)
 	}
 }
@@ -37,8 +35,7 @@ func BenchmarkIsRevoked_Miss(b *testing.B) {
 func BenchmarkIsRevoked_NilCert(b *testing.B) {
 	p := newWithEntries(100)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = p.IsRevoked(nil)
 	}
 }

@@ -36,7 +36,7 @@ func TestNewPollingChecker_RequiresURL(t *testing.T) {
 // reads one value off the queue and returns it as JSON.
 type snapshotServer struct {
 	server   *httptest.Server
-	requests int32 // count of poll calls
+	requests atomic.Int32 // count of poll calls
 
 	mu       chan struct{}
 	snapshot revcheck.Snapshot
@@ -51,7 +51,7 @@ func newSnapshotServer(t *testing.T) *snapshotServer {
 	}
 	s.mu <- struct{}{}
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&s.requests, 1)
+		s.requests.Add(1)
 		<-s.mu
 		body, _ := json.Marshal(s.snapshot)
 		status := s.status

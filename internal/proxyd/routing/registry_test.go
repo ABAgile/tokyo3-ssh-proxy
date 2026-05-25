@@ -302,14 +302,14 @@ func TestRegistry_ConcurrentRegisterLookup(t *testing.T) {
 	const n = 32
 
 	sessions := make([]*yamux.Session, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		_, s := twoSessions(t)
 		sessions[i] = s
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(n * 2)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go func(i int) {
 			defer wg.Done()
 			label := hostLabel(i)

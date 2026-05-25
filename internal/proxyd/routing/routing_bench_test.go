@@ -23,8 +23,7 @@ func BenchmarkRegistry_Lookup_Hit(b *testing.B) {
 	}
 	const target = "host-500"
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_, _ = r.Lookup(target)
 	}
 }
@@ -42,8 +41,7 @@ func BenchmarkRegistry_Lookup_Miss(b *testing.B) {
 		}
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_, _ = r.Lookup("not-a-real-host")
 	}
 }
@@ -58,8 +56,7 @@ func BenchmarkRegistry_RegisterUnregister(b *testing.B) {
 	_, s := twoSessions(b)
 	const label = "bench-host"
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := r.Register(s, label); err != nil {
 			b.Fatalf("Register: %v", err)
 		}

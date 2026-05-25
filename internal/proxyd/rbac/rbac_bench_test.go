@@ -32,8 +32,7 @@ func BenchmarkPermitsPTY(b *testing.B) {
 		},
 	})
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = enforcer.PermitsPTY()
 	}
 }
@@ -47,8 +46,7 @@ func BenchmarkSourceAddressOK_NoRestriction(b *testing.B) {
 	})
 	addr := remote{ip: "10.0.0.42"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = enforcer.SourceAddressOK(addr)
 	}
 }
@@ -65,8 +63,7 @@ func BenchmarkSourceAddressOK_CIDRMatch(b *testing.B) {
 	})
 	addr := remote{ip: "10.0.0.42"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = enforcer.SourceAddressOK(addr)
 	}
 }
@@ -83,8 +80,7 @@ func BenchmarkSourceAddressOK_LastRange(b *testing.B) {
 	})
 	addr := remote{ip: "203.0.113.7"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = enforcer.SourceAddressOK(addr)
 	}
 }

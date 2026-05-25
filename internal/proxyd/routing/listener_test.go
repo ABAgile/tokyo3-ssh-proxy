@@ -248,8 +248,7 @@ func TestListener_Serve_RejectsCertWithoutSPIFFEURI(t *testing.T) {
 	}
 	ln, _ := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
 	addr := ln.Addr().String()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = l.Serve(ctx, ln) }()
 
 	tlsClient, err := tls.Dial("tcp", addr, clientTLS)
@@ -284,8 +283,7 @@ func TestListener_Serve_CustomHostExtractor(t *testing.T) {
 	}
 	ln, _ := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
 	addr := ln.Addr().String()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = l.Serve(ctx, ln) }()
 
 	tlsClient, err := tls.Dial("tcp", addr, clientTLS)

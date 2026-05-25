@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 
 	gossh "golang.org/x/crypto/ssh"
 
@@ -184,8 +183,8 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 		pfAuditor.Open(context.Background())
 		defer func() {
 			pfAuditor.Close(context.Background(),
-				atomic.LoadInt64(&pfCh.bytesRead),
-				atomic.LoadInt64(&pfCh.bytesWritten))
+				pfCh.bytesRead.Load(),
+				pfCh.bytesWritten.Load())
 		}()
 	}
 
@@ -407,8 +406,7 @@ func (p *Proxier) permitsRequest(reqType string) bool {
 // the precise (reason, message) tuple the user-side channel reject
 // requires. Generic errors become ConnectionFailed.
 func openChannelRejection(err error) (gossh.RejectionReason, string) {
-	var oce *gossh.OpenChannelError
-	if errors.As(err, &oce) {
+	if oce, ok := errors.AsType[*gossh.OpenChannelError](err); ok {
 		return oce.Reason, oce.Message
 	}
 	return gossh.ConnectionFailed, err.Error()

@@ -1,7 +1,6 @@
 package ssh_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -78,8 +77,7 @@ func TestEndToEnd_RevocationEnforcementPropagatesToHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPollingChecker: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = checker.Run(ctx) }()
 
 	// Wait for the first refresh to land (signals the polling
@@ -111,8 +109,7 @@ func TestEndToEnd_RevocationEnforcementPropagatesToHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pssh.New: %v", err)
 	}
-	srvCtx, cancelSrv := context.WithCancel(context.Background())
-	defer cancelSrv()
+	srvCtx := t.Context()
 	go func() { _ = srv.ListenAndServe(srvCtx) }()
 	deadline = time.Now().Add(2 * time.Second)
 	for srv.Addr() == "" && time.Now().Before(deadline) {
@@ -201,8 +198,7 @@ func TestEndToEnd_RevocationByKeyID(t *testing.T) {
 		URL:          fakeCertd.server.URL + "/api/v1/ssh/revocations",
 		PollInterval: 50 * time.Millisecond,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = checker.Run(ctx) }()
 
 	// Wait for the snapshot to land in-memory.
@@ -229,8 +225,7 @@ func TestEndToEnd_RevocationByKeyID(t *testing.T) {
 		TargetHostKeyCallback: gossh.FixedHostKey(target.hostPub),
 		Revocations:           checker,
 	})
-	srvCtx, cancelSrv := context.WithCancel(context.Background())
-	defer cancelSrv()
+	srvCtx := t.Context()
 	go func() { _ = srv.ListenAndServe(srvCtx) }()
 	deadline = time.Now().Add(2 * time.Second)
 	for srv.Addr() == "" && time.Now().Before(deadline) {
