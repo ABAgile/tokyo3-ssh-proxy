@@ -86,10 +86,21 @@ func (r *Registry) Register(session *yamux.Session, hosts ...string) ([]string, 
 	}
 
 	// Validate first so a conflict mid-list doesn't leave partial state.
+	// A dead existing session is evicted in-place rather than treated as
+	// a conflict — the typical case is a tunnel that died and is
+	// reconnecting faster than the listener's deferred Unregister
+	// fires. Without this check the new session would loop forever
+	// hitting a "already registered" rejection.
 	for _, h := range normalized {
-		if existing, ok := r.tunnels[h]; ok && existing.session != session {
-			return nil, fmt.Errorf("host %q already registered by a different session", h)
+		existing, ok := r.tunnels[h]
+		if !ok || existing.session == session {
+			continue
 		}
+		if isDead(existing.session) {
+			evictSession(r.tunnels, existing.session)
+			continue
+		}
+		return nil, fmt.Errorf("host %q already registered by a different session", h)
 	}
 
 	e := &entry{session: session, hosts: normalized}
@@ -216,6 +227,18 @@ func isDead(session *yamux.Session) bool {
 		return true
 	}
 	return session.IsClosed()
+}
+
+// evictSession removes every label pointing at session. Caller must
+// hold the registry's write lock; this is a helper for the in-line
+// conflict-resolution path in Register where calling Unregister
+// would deadlock.
+func evictSession(tunnels map[string]*entry, session *yamux.Session) {
+	for h, e := range tunnels {
+		if e.session == session {
+			delete(tunnels, h)
+		}
+	}
 }
 
 // sortStrings sorts in place. Wrapped to keep the import surface of

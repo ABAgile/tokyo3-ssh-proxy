@@ -128,6 +128,29 @@ func TestRegistry_Register_AtomicOnConflict(t *testing.T) {
 	}
 }
 
+func TestRegistry_Register_EvictsDeadSessionUnderSameLabel(t *testing.T) {
+	// A tunnel that died and is reconnecting under the same host
+	// label must not hit a stale "already registered" conflict —
+	// otherwise the dialer loops indefinitely while waiting for the
+	// listener's deferred Unregister to fire.
+	r := routing.New()
+	_, oldSess := twoSessions(t)
+	_, newSess := twoSessions(t)
+
+	if _, err := r.Register(oldSess, "db-1"); err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	_ = oldSess.Close()
+	time.Sleep(10 * time.Millisecond) // yamux IsClosed flip
+
+	if _, err := r.Register(newSess, "db-1"); err != nil {
+		t.Errorf("re-register after old session died: %v", err)
+	}
+	if s, _ := r.Lookup("db-1"); s != newSess {
+		t.Errorf("Lookup after reconnect returned wrong session")
+	}
+}
+
 func TestRegistry_Register_AcceptsSameSessionAdditionalLabels(t *testing.T) {
 	r := routing.New()
 	_, sess := twoSessions(t)
