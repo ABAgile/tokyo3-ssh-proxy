@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -433,6 +434,107 @@ func TestAudit_NoRecordingCompletedForNonPTYSession(t *testing.T) {
 	if completed := cap.findActions(t, audit.ActionRecordingComplete); len(completed) != 0 {
 		t.Errorf("non-PTY session produced %d recording.completed entries, want 0", len(completed))
 	}
+}
+
+func TestAudit_EmitsPortForwardOpenedAndClosed(t *testing.T) {
+	// User opens a direct-tcpip channel through the proxy; the fake
+	// target echoes the bytes back. Round-trip should produce one
+	// port_forward.opened (decoded src/dst from the channel extra-
+	// data) and one port_forward.closed with byte counts.
+	addr, cap, target, certSigner, cleanup := newAuditTestServer(t)
+	defer cleanup()
+
+	client, err := dialAsUser(addr, "alice@"+target.addr, gossh.PublicKeys(certSigner))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	// gossh.Client.Dial opens a direct-tcpip channel. We don't need
+	// a real listener on the other side — the fakeTarget's echo
+	// handler picks it up.
+	conn, err := client.Dial("tcp", "internal-target:5432")
+	if err != nil {
+		t.Fatalf("Dial port-forward: %v", err)
+	}
+	const payload = "hello-postgres"
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf) != payload {
+		t.Errorf("echo round-trip = %q, want %q", string(buf), payload)
+	}
+	_ = conn.Close()
+	_ = client.Close()
+	time.Sleep(80 * time.Millisecond)
+
+	opened := cap.findActions(t, audit.ActionPortForwardOpened)
+	if len(opened) != 1 {
+		t.Fatalf("opened entries = %d, want 1", len(opened))
+	}
+	if !strings.Contains(opened[0].Target, "internal-target:5432") {
+		t.Errorf("opened.Target = %q, want internal-target:5432", opened[0].Target)
+	}
+	if !strings.Contains(opened[0].Metadata, `"dst_host":"internal-target"`) {
+		t.Errorf("opened.Metadata missing dst_host: %q", opened[0].Metadata)
+	}
+	if !strings.Contains(opened[0].Metadata, `"dst_port":5432`) {
+		t.Errorf("opened.Metadata missing dst_port: %q", opened[0].Metadata)
+	}
+	if opened[0].SessionID == "" {
+		t.Error("opened.SessionID empty")
+	}
+
+	closed := cap.findActions(t, audit.ActionPortForwardClosed)
+	if len(closed) != 1 {
+		t.Fatalf("closed entries = %d, want 1", len(closed))
+	}
+	// Byte counts: user wrote `payload` then read `payload` back.
+	// bytes_in = bytes the proxy read from the user side (payload).
+	// bytes_out = bytes the proxy wrote to the user side (echo back).
+	// Both should equal len(payload).
+	for _, want := range []string{
+		`"bytes_in":` + itoaPort(len(payload)),
+		`"bytes_out":` + itoaPort(len(payload)),
+		`"dst_host":"internal-target"`,
+		`"duration_seconds"`,
+	} {
+		if !strings.Contains(closed[0].Metadata, want) {
+			t.Errorf("closed.Metadata missing %q\n--- metadata ---\n%s", want, closed[0].Metadata)
+		}
+	}
+
+	// opened + closed share the SessionID with session.opened.
+	sess := cap.findActions(t, audit.ActionSessionOpened)
+	if len(sess) == 1 {
+		if opened[0].SessionID != sess[0].SessionID {
+			t.Errorf("port_forward.opened.SessionID != session.opened.SessionID (%q != %q)",
+				opened[0].SessionID, sess[0].SessionID)
+		}
+		if closed[0].SessionID != sess[0].SessionID {
+			t.Errorf("port_forward.closed.SessionID != session.opened.SessionID")
+		}
+	}
+}
+
+// itoaPort is a tiny strconv.Itoa replacement so this test file
+// avoids the strconv import for one integer.
+func itoaPort(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var buf [8]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(buf[pos:])
 }
 
 // Compile-time interface check — fails fast if captureSink drifts

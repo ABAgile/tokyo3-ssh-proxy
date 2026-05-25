@@ -119,6 +119,8 @@ can be correlated.
 | `session.closed`       | When the SSH connection ends (success or error).              |
 | `channel.rejected`     | When a channel-open request is denied by RBAC or routing.     |
 | `recording.completed`  | When a PTY session's asciinema cast file has been finalised.  |
+| `port_forward.opened`  | After a `direct-tcpip` channel is accepted (src/dst host:port).|
+| `port_forward.closed`  | When the `direct-tcpip` channel ends (bytes_in/out, duration). |
 
 `recording.completed` carries the absolute cast path and metadata with
 `duration_seconds` and `started_at`. Audit emission is best-effort —

@@ -1,12 +1,14 @@
 package session
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	gossh "golang.org/x/crypto/ssh"
 
@@ -117,11 +119,29 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 	// Per-channel-type RBAC gates. The set is small for now;
 	// follow-on slices add tcpip-forward (remote -R), session-level
 	// x11-req / auth-agent-req, and force-command substitution.
+	var pfAuditor *portForwardAuditor
 	switch newCh.ChannelType() {
 	case "direct-tcpip":
 		if !p.rbac.PermitsPortForwarding() {
 			_ = newCh.Reject(gossh.Prohibited, "port forwarding not permitted by cert")
 			return
+		}
+		// Decode the extra-data so we can emit a structured audit
+		// event when the channel opens. Decode failures are
+		// non-fatal — log and continue without auditing this
+		// channel, rather than blocking a valid forward request.
+		req, err := parseDirectTCPIPRequest(newCh.ExtraData())
+		if err != nil {
+			p.log.Warn("direct-tcpip extra-data decode failed; audit attribution will be empty",
+				"session_id", p.sessionID, "err", err)
+		} else {
+			pfAuditor = &portForwardAuditor{
+				sink:      p.auditSink,
+				log:       p.log,
+				sessionID: p.sessionID,
+				attr:      p.sessionAttr,
+				req:       req,
+			}
 		}
 	}
 
@@ -148,6 +168,25 @@ func (p *Proxier) handleChannel(newCh gossh.NewChannel) {
 	if newCh.ChannelType() == "session" && p.sink != nil {
 		rec = newChannelRecorder(p.sink, p.sessionID, p.user, p.host, p.sessionAttr, p.auditSink, p.log)
 		defer rec.Close()
+	}
+
+	// Port-forward audit: wrap the user-side channel with byte
+	// counters and emit opened/closed events around the pipe.
+	// closeBoth in pipeChannel runs even when Close errors out, so
+	// the deferred emission is guaranteed. The closure-form defer
+	// is essential — direct args are evaluated at defer-registration
+	// time (still zero), only a closure samples the counters after
+	// pipeChannel returns.
+	var pfCh *countingChannel
+	if pfAuditor != nil {
+		pfCh = &countingChannel{Channel: srcCh}
+		srcCh = pfCh
+		pfAuditor.Open(context.Background())
+		defer func() {
+			pfAuditor.Close(context.Background(),
+				atomic.LoadInt64(&pfCh.bytesRead),
+				atomic.LoadInt64(&pfCh.bytesWritten))
+		}()
 	}
 
 	p.pipeChannel(srcCh, srcReqs, targetCh, targetReqs, rec)

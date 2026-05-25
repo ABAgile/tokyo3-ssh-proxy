@@ -117,7 +117,23 @@ func (ft *fakeTarget) serveConn(conn net.Conn, cfg *gossh.ServerConfig) {
 
 	for newCh := range channels {
 		ft.gotChannel <- newCh.ChannelType()
-		if newCh.ChannelType() != "session" {
+		switch newCh.ChannelType() {
+		case "session":
+			// fall through to the existing session handler
+		case "direct-tcpip":
+			// Echo every byte the user sends to the (mocked) remote
+			// host. Lets port-forward tests round-trip data through
+			// the proxy and assert on the audit attribution.
+			ch, _, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			go func(c gossh.Channel) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(ch)
+			continue
+		default:
 			_ = newCh.Reject(gossh.UnknownChannelType, newCh.ChannelType())
 			continue
 		}
