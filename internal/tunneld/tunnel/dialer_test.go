@@ -315,6 +315,44 @@ func TestDialer_Run_RetriesAfterDialFailure(t *testing.T) {
 	<-runErrCh
 }
 
+func TestDialer_Run_AppendsDialErrorAttrs(t *testing.T) {
+	// Point at a kernel-assigned port that nothing listens on, so
+	// every dial fails fast and the hook fires once per attempt.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	clientTLS, _ := mintTLS(t)
+	var hookCalls atomic.Int32
+	d, _ := tunnel.New(tunnel.Config{
+		Target:         addr,
+		TLSConfig:      clientTLS,
+		DialTimeout:    20 * time.Millisecond,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+		BackoffJitter:  0,
+		Handler: func(ctx context.Context, _ *yamux.Session) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		DialErrorAttrs: func() []any {
+			hookCalls.Add(1)
+			return []any{"workload_cert_remaining", time.Hour}
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_ = d.Run(ctx)
+
+	if got := hookCalls.Load(); got < 2 {
+		t.Errorf("DialErrorAttrs invocations = %d, want ≥ 2 (one per failed dial)", got)
+	}
+}
+
 func TestDialer_Run_ReconnectsAfterHandlerReturn(t *testing.T) {
 	clientTLS, serverTLS := mintTLS(t)
 	fp := newFakeProxy(t, serverTLS)

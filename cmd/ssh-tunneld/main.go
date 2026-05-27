@@ -63,6 +63,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/spf13/cobra"
@@ -107,9 +108,30 @@ func runAgent(ctx context.Context) error {
 	log, _ := applog.AppLogger(appName, applog.WithStdout())
 
 	proxyAddr := mustEnv("SSH_TUNNELD_PROXY_ADDR")
-	tlsCfg, err := loadWorkloadTLS(proxyAddr)
+	tlsCfg, workloadNotAfter, err := loadWorkloadTLS(proxyAddr)
 	if err != nil {
 		return fmt.Errorf("workload tls: %w", err)
+	}
+
+	// The workload cert is loaded once into memory and never refreshed
+	// (no GetClientCertificate reloader yet); if cert-agentd rotates
+	// it on disk, ssh-tunneld won't pick up the new one until restart.
+	// Surface remaining validity so operators see exhaustion coming.
+	if !workloadNotAfter.IsZero() {
+		if remaining := time.Until(workloadNotAfter); remaining < 24*time.Hour {
+			log.Warn("workload mTLS cert near expiry — restart ssh-tunneld after the next rotation",
+				"remaining", remaining.Round(time.Second),
+				"not_after", workloadNotAfter)
+		}
+	}
+
+	// Shared closure used by both retry surfaces (dialer + host-cert
+	// renewer) so operators see the same field on every failure log.
+	workloadRemainingAttrs := func() []any {
+		if workloadNotAfter.IsZero() {
+			return nil
+		}
+		return []any{"workload_cert_remaining", time.Until(workloadNotAfter).Round(time.Second)}
 	}
 
 	localAddr := envOr("SSH_TUNNELD_LOCAL_SSHD", forward.DefaultLocalAddr)
@@ -120,10 +142,11 @@ func runAgent(ctx context.Context) error {
 	log.Info("local sshd target configured", "addr", localAddr)
 
 	dialer, err := tunnel.New(tunnel.Config{
-		Target:    proxyAddr,
-		TLSConfig: tlsCfg,
-		Handler:   fwd.Handle,
-		Log:       log,
+		Target:         proxyAddr,
+		TLSConfig:      tlsCfg,
+		Handler:        fwd.Handle,
+		Log:            log,
+		DialErrorAttrs: workloadRemainingAttrs,
 	})
 	if err != nil {
 		return fmt.Errorf("dialer: %w", err)
@@ -133,7 +156,7 @@ func runAgent(ctx context.Context) error {
 	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	renewer, err := buildHostCertRenewer(log, tlsCfg)
+	renewer, err := buildHostCertRenewer(log, tlsCfg, workloadRemainingAttrs)
 	if err != nil {
 		return fmt.Errorf("host cert renewer: %w", err)
 	}
@@ -212,22 +235,36 @@ func envFirst(keys ...string) string {
 // server cert. ServerName defaults to the host portion of proxyAddr
 // but can be overridden when DNS doesn't match the cert's
 // presented SAN.
-func loadWorkloadTLS(proxyAddr string) (*tls.Config, error) {
+//
+// Returns the loaded leaf's NotAfter alongside the config so the
+// caller can surface remaining validity in startup + failure logs.
+// Today the in-memory cert is never refreshed (no reloader); the
+// returned timestamp reflects what the dialer will keep presenting
+// until the process restarts.
+func loadWorkloadTLS(proxyAddr string) (*tls.Config, time.Time, error) {
 	certFile := mustEnv("SSH_TUNNELD_TLS_CERT")
 	keyFile := mustEnv("SSH_TUNNELD_TLS_KEY")
 	caFile := mustEnv("SSH_TUNNELD_TLS_CA")
 
 	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("load workload cert pair: %w", err)
+		return nil, time.Time{}, fmt.Errorf("load workload cert pair: %w", err)
+	}
+	var notAfter time.Time
+	if len(keyPair.Certificate) > 0 {
+		leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("parse workload leaf %s: %w", certFile, err)
+		}
+		notAfter = leaf.NotAfter
 	}
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
-		return nil, fmt.Errorf("read CA: %w", err)
+		return nil, time.Time{}, fmt.Errorf("read CA: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("CA %s contains no PEM certs", caFile)
+		return nil, time.Time{}, fmt.Errorf("CA %s contains no PEM certs", caFile)
 	}
 
 	serverName := os.Getenv("SSH_TUNNELD_PROXY_SERVER_NAME")
@@ -244,14 +281,14 @@ func loadWorkloadTLS(proxyAddr string) (*tls.Config, error) {
 		RootCAs:      pool,
 		ServerName:   serverName,
 		MinVersion:   tls.VersionTLS12,
-	}, nil
+	}, notAfter, nil
 }
 
 // buildHostCertRenewer returns a configured renewer when
 // SSH_TUNNELD_HOST_KEY is set; otherwise nil so the caller skips the
 // renewal goroutine. Reuses the workload mTLS config (workloadTLS)
 // for the certd HTTP client when SSH_TUNNELD_CERTD_CA is unset.
-func buildHostCertRenewer(log *slog.Logger, workloadTLS *tls.Config) (*hostcert.Renewer, error) {
+func buildHostCertRenewer(log *slog.Logger, workloadTLS *tls.Config, signErrorAttrs func() []any) (*hostcert.Renewer, error) {
 	hostKeyPath := os.Getenv("SSH_TUNNELD_HOST_KEY")
 	if hostKeyPath == "" {
 		log.Warn("SSH_TUNNELD_HOST_KEY unset — host cert renewer disabled")
@@ -294,6 +331,7 @@ func buildHostCertRenewer(log *slog.Logger, workloadTLS *tls.Config) (*hostcert.
 		KeyID:          keyID,
 		Principals:     principals,
 		Log:            log,
+		SignErrorAttrs: signErrorAttrs,
 	})
 	if err != nil {
 		return nil, err

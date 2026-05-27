@@ -303,6 +303,43 @@ func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	}
 }
 
+func TestRenewer_Run_AppendsSignErrorAttrs(t *testing.T) {
+	dir := t.TempDir()
+	hostKeyPath := filepath.Join(dir, "k")
+	writeHostPrivateKey(t, hostKeyPath)
+
+	var calls atomic.Int32
+	signer := &stubSigner{respFn: func(_ certclient.SignHostRequest) (*certclient.SignHostResponse, error) {
+		calls.Add(1)
+		return nil, errors.New("certd unreachable")
+	}}
+	var hookCalls atomic.Int32
+	r, _ := hostcert.New(hostcert.Config{
+		Signer:           signer,
+		HostKeyPath:      hostKeyPath,
+		CertOutputPath:   filepath.Join(dir, "k-cert.pub"),
+		KeyID:            "host:recover",
+		Principals:       []string{"recover"},
+		MinRenewInterval: 10 * time.Millisecond,
+		RetryBackoff:     10 * time.Millisecond,
+		SignErrorAttrs: func() []any {
+			hookCalls.Add(1)
+			return []any{"workload_cert_remaining", time.Hour}
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if got := calls.Load(); got < 2 {
+		t.Errorf("sign calls = %d, want ≥ 2", got)
+	}
+	if got := hookCalls.Load(); got != calls.Load() {
+		t.Errorf("SignErrorAttrs invocations = %d, want %d (once per failure)", got, calls.Load())
+	}
+}
+
 func TestRenewer_nextRenewalDelay_RespectsFraction(t *testing.T) {
 	dir := t.TempDir()
 	hostKeyPath := filepath.Join(dir, "k")

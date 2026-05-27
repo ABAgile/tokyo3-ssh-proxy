@@ -88,6 +88,15 @@ type Config struct {
 
 	// Log is the logger. nil ⇒ slog.Default.
 	Log *slog.Logger
+
+	// SignErrorAttrs, if set, returns extra structured fields the
+	// renewer appends to its per-failure retry-log warn line. Use
+	// this to surface caller-specific context (e.g., remaining
+	// validity on the mTLS material the agent presents to certd)
+	// without coupling this package to the caller's bootstrap
+	// concepts. Called once per failed SignOnce inside Run, before
+	// the retry sleep. Nil ⇒ no extra fields.
+	SignErrorAttrs func() []any
 }
 
 // Renewer signs the host cert on a schedule and writes it atomically
@@ -197,7 +206,11 @@ func (r *Renewer) Run(ctx context.Context) error {
 		validAfter, validBefore, err := r.SignOnce(ctx)
 		var wait time.Duration
 		if err != nil {
-			r.cfg.Log.Warn("host cert sign failed; will retry", "err", err, "backoff", r.cfg.RetryBackoff)
+			args := []any{"err", err, "backoff", r.cfg.RetryBackoff}
+			if r.cfg.SignErrorAttrs != nil {
+				args = append(args, r.cfg.SignErrorAttrs()...)
+			}
+			r.cfg.Log.Warn("host cert sign failed; will retry", args...)
 			wait = r.cfg.RetryBackoff
 		} else {
 			wait = r.nextRenewalDelay(validAfter, validBefore)

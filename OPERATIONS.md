@@ -197,6 +197,21 @@ with exponential backoff (1s → 30s, ±20% jitter). The tunnel host
 isn't reachable via the proxy during the outage; user sessions
 get `target unreachable`. No restart needed once the proxy is back.
 
+Each retry-log line carries `workload_cert_remaining=<duration>` —
+the time left on the in-memory workload mTLS cert ssh-tunneld
+presents to both the proxy and certd. The cert is loaded once at
+startup and is **not** refreshed in-process, so an external
+rotation (cert-agentd, manual replace) needs an ssh-tunneld
+restart to take effect; until then this duration counts down
+toward zero. The same field is appended to the host-cert renewer's
+`host cert sign failed; will retry` log line, so a long certd
+outage that crosses the cert's expiry surfaces as a clearly-
+labelled countdown rather than identical-looking error spam.
+
+At startup, if the loaded workload cert is within 24h of expiry,
+the agent emits a one-shot warn:
+`workload mTLS cert near expiry — restart ssh-tunneld after the next rotation`.
+
 ### What happens when the local sshd restarts
 
 The forwarder's per-stream dial fails for in-flight streams; those

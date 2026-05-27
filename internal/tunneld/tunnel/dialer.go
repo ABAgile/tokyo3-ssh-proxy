@@ -65,6 +65,15 @@ type Config struct {
 
 	// Log is the logger. nil ⇒ slog.Default.
 	Log *slog.Logger
+
+	// DialErrorAttrs, if set, returns extra structured fields the
+	// dialer appends to its per-failure backoff-log warn line. Use
+	// this to thread caller-specific context (e.g., remaining
+	// validity on the mTLS material the agent presents to the proxy)
+	// into the dialer's logs without coupling this package to the
+	// caller's bootstrap concepts. Called once per failed dial,
+	// before the sleep. Nil ⇒ no extra fields.
+	DialErrorAttrs func() []any
 }
 
 // Production defaults — picked to detect a half-open link within
@@ -162,8 +171,11 @@ func (d *Dialer) Run(ctx context.Context) error {
 
 		session, err := d.DialOnce(ctx)
 		if err != nil {
-			d.cfg.Log.Warn("tunnel dial failed; backing off",
-				"target", d.cfg.Target, "err", err, "backoff", delay)
+			args := []any{"target", d.cfg.Target, "err", err, "backoff", delay}
+			if d.cfg.DialErrorAttrs != nil {
+				args = append(args, d.cfg.DialErrorAttrs()...)
+			}
+			d.cfg.Log.Warn("tunnel dial failed; backing off", args...)
 			if sleepErr := d.sleep(ctx, d.applyJitter(delay)); sleepErr != nil {
 				return sleepErr
 			}
