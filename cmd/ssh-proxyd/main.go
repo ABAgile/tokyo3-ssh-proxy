@@ -202,11 +202,6 @@ func runServe(ctx context.Context) error {
 	}
 	log.Info("user ca ready", "fingerprint", gossh.FingerprintSHA256(userCA))
 
-	signerFunc, err := loadClientSignerFunc(log)
-	if err != nil {
-		return fmt.Errorf("client signer: %w", err)
-	}
-
 	hostKeyCB, err := loadTargetHostKeyCallback(log)
 	if err != nil {
 		return fmt.Errorf("target host key callback: %w", err)
@@ -223,7 +218,37 @@ func runServe(ctx context.Context) error {
 	}
 	defer closeIfCloser(auditSink)
 
-	registry, tunnelListener, err := buildTunnelListener(log)
+	// Build the certd-client TLS reloader once when any certd-
+	// touching surface is enabled (per-session minter OR revocation
+	// poller). Shared by both so the workload cert + CA pool live
+	// in a single hot-reloadable holder. nil when neither surface
+	// needs to talk to certd.
+	var certdReloader *certdClientReloader
+	if os.Getenv("CERTD_URL") != "" || os.Getenv("CERTD_REVOCATIONS_URL") != "" {
+		certdReloader, err = newCertdClientReloader(
+			os.Getenv("CERTD_MTLS_CERT"),
+			os.Getenv("CERTD_MTLS_KEY"),
+			os.Getenv("CERTD_CA_BUNDLE"),
+		)
+		if err != nil {
+			return fmt.Errorf("certd-client tls: %w", err)
+		}
+		warnIfCertdCertNearExpiry(log, certdReloader.LeafExpiry())
+	}
+
+	// Build the tunnel-server TLS reloader once when the listener
+	// is enabled. nil when SSH_PROXYD_TUNNEL_ADDR is unset.
+	tunnelReloader, err := newTunnelServerReloaderFromEnv()
+	if err != nil {
+		return fmt.Errorf("tunnel-server tls: %w", err)
+	}
+
+	signerFunc, err := loadClientSignerFunc(log, certdReloader)
+	if err != nil {
+		return fmt.Errorf("client signer: %w", err)
+	}
+
+	registry, tunnelListener, err := buildTunnelListener(log, tunnelReloader)
 	if err != nil {
 		return fmt.Errorf("tunnel listener: %w", err)
 	}
@@ -231,7 +256,7 @@ func runServe(ctx context.Context) error {
 		defer func() { _ = registry.Close() }()
 	}
 
-	revocationChecker, err := buildRevocationChecker(log)
+	revocationChecker, err := buildRevocationChecker(log, certdReloader)
 	if err != nil {
 		return fmt.Errorf("revocation checker: %w", err)
 	}
@@ -259,6 +284,27 @@ func runServe(ctx context.Context) error {
 		go func() {
 			if err := revocationChecker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("revocation poller exited", "err", err)
+			}
+		}()
+	}
+
+	// CA-bundle mtime pollers — one per reloader. Each polls every
+	// DefaultCAPollInterval and reloads its bundle on mtime advance,
+	// letting operators rotate the CA pool without restart. Exits
+	// are not treated as fatal here; they only ever return when the
+	// rootCtx cancels (typical shutdown) or after a misconfigured
+	// reloader was constructed (caught earlier).
+	if certdReloader != nil {
+		go func() {
+			if err := certdReloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("certd-client CA poller exited", "err", err)
+			}
+		}()
+	}
+	if tunnelReloader != nil {
+		go func() {
+			if err := tunnelReloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("tunnel client CA poller exited", "err", err)
 			}
 		}()
 	}
@@ -299,17 +345,15 @@ func runServe(ctx context.Context) error {
 // TLS material reuses the certd mTLS env vars the per-session
 // minter already understands (CERTD_MTLS_CERT / _KEY / CERTD_CA_BUNDLE)
 // — operators don't need separate keys for the revocations endpoint.
-func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) {
+func buildRevocationChecker(log *slog.Logger, reloader *certdClientReloader) (*revcheck.PollingChecker, error) {
 	url := os.Getenv("CERTD_REVOCATIONS_URL")
 	if url == "" {
 		log.Warn("CERTD_REVOCATIONS_URL unset — revocation checking disabled (revoked certs will still be accepted)")
 		return nil, nil
 	}
-	tlsCfg, notAfter, err := loadCertdMTLS()
-	if err != nil {
-		return nil, fmt.Errorf("revocation mTLS: %w", err)
+	if reloader == nil {
+		return nil, errors.New("certd-client reloader is required when CERTD_REVOCATIONS_URL is set")
 	}
-	warnIfCertdCertNearExpiry(log, notAfter)
 	period := DefaultRevocationPollInterval
 	if v := os.Getenv("CERTD_REVOCATIONS_POLL_SECONDS"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -320,10 +364,10 @@ func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) 
 	}
 	checker, err := revcheck.NewPollingChecker(revcheck.Config{
 		URL:               url,
-		TLSConfig:         tlsCfg,
+		TLSConfig:         reloader.TLSConfig(),
 		PollInterval:      period,
 		Log:               log,
-		RefreshErrorAttrs: workloadRemainingAttrsFor(notAfter),
+		RefreshErrorAttrs: workloadRemainingAttrsFor(reloader),
 	})
 	if err != nil {
 		return nil, err
@@ -332,15 +376,9 @@ func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) 
 	return checker, nil
 }
 
-// certdCertWarnOnce ensures the startup near-expiry warn fires at
-// most once even when both certd-touching surfaces (revcheck poller
-// and per-session minter) load the same cert.
-var certdCertWarnOnce sync.Once
-
 // warnIfCertdCertNearExpiry emits the one-shot startup warn if the
-// loaded certd-client cert is within 24h of expiry. Called from the
-// two places that build a certd HTTP client (revocation poller and
-// per-session minter); sync.Once dedupes the message.
+// loaded certd-client cert is within 24h of expiry. Called once
+// from runServe right after the reloader is built.
 func warnIfCertdCertNearExpiry(log *slog.Logger, notAfter time.Time) {
 	if notAfter.IsZero() {
 		return
@@ -349,26 +387,27 @@ func warnIfCertdCertNearExpiry(log *slog.Logger, notAfter time.Time) {
 	if remaining >= 24*time.Hour {
 		return
 	}
-	certdCertWarnOnce.Do(func() {
-		log.Warn("certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation",
-			"remaining", remaining.Round(time.Second),
-			"not_after", notAfter)
-	})
+	log.Warn("certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation",
+		"remaining", remaining.Round(time.Second),
+		"not_after", notAfter)
 }
 
 // workloadRemainingAttrsFor returns the closure both the revcheck
 // poller and the minter wrap their failure logs with, so operators
 // see a uniform workload_cert_remaining field on every certd-side
 // failure regardless of which surface produced it. The closure
-// captures notAfter by value at startup; today the cert is loaded
-// once and never refreshed in-process, so the timestamp is stable
-// across the lifetime of the process.
-func workloadRemainingAttrsFor(notAfter time.Time) func() []any {
-	if notAfter.IsZero() {
+// queries the reloader on every call so a future cert refresh
+// (SIGHUP hook, mtime poll) propagates without further wiring.
+func workloadRemainingAttrsFor(r *certdClientReloader) func() []any {
+	if r == nil {
 		return nil
 	}
 	return func() []any {
-		return []any{"workload_cert_remaining", time.Until(notAfter).Round(time.Second)}
+		exp := r.LeafExpiry()
+		if exp.IsZero() {
+			return nil
+		}
+		return []any{"workload_cert_remaining", time.Until(exp).Round(time.Second)}
 	}
 }
 
@@ -377,45 +416,42 @@ func workloadRemainingAttrsFor(notAfter time.Time) func() []any {
 // stay in sync.
 const DefaultRevocationPollInterval = 30 * time.Second
 
-// buildTunnelListener returns the routing.Registry + Listener pair
-// when SSH_PROXYD_TUNNEL_ADDR is configured. When unset, both
-// returns are nil — the proxy serves only direct-TCP target dials.
-func buildTunnelListener(log *slog.Logger) (*routing.Registry, *routing.Listener, error) {
-	addr := os.Getenv("SSH_PROXYD_TUNNEL_ADDR")
-	if addr == "" {
-		log.Warn("SSH_PROXYD_TUNNEL_ADDR unset — tunnel acceptance disabled; all sessions use direct TCP")
-		return nil, nil, nil
+// newTunnelServerReloaderFromEnv reads the inbound-listener TLS
+// envs and returns the reloader. nil when SSH_PROXYD_TUNNEL_ADDR is
+// unset (tunnel acceptance disabled). Validation of required env
+// vars is shared between the reloader construction here and the
+// buildTunnelListener call below; SSH_PROXYD_TUNNEL_ADDR is treated
+// as the master switch.
+func newTunnelServerReloaderFromEnv() (*tunnelServerReloader, error) {
+	if os.Getenv("SSH_PROXYD_TUNNEL_ADDR") == "" {
+		return nil, nil
 	}
 	certFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_CERT")
 	keyFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_KEY")
 	caFile := envFirst("SSH_PROXYD_TUNNEL_CLIENT_CA", "SSH_PROXYD_WORKLOAD_CA")
 	if certFile == "" || keyFile == "" || caFile == "" {
-		return nil, nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
+		return nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
+	return newTunnelServerReloader(certFile, keyFile, caFile)
+}
 
-	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load tunnel server cert: %w", err)
+// buildTunnelListener returns the routing.Registry + Listener pair
+// when SSH_PROXYD_TUNNEL_ADDR is configured. When unset (reloader
+// is nil), both returns are nil — the proxy serves only direct-TCP
+// target dials.
+func buildTunnelListener(log *slog.Logger, reloader *tunnelServerReloader) (*routing.Registry, *routing.Listener, error) {
+	addr := os.Getenv("SSH_PROXYD_TUNNEL_ADDR")
+	if addr == "" {
+		log.Warn("SSH_PROXYD_TUNNEL_ADDR unset — tunnel acceptance disabled; all sessions use direct TCP")
+		return nil, nil, nil
 	}
-	caPEM, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read tunnel client CA: %w", err)
+	if reloader == nil {
+		return nil, nil, errors.New("tunnel server reloader is required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, nil, fmt.Errorf("tunnel client CA %s contains no PEM certs", caFile)
-	}
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{keyPair},
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
-	}
-
 	registry := routing.New()
 	listener, err := routing.NewListener(routing.ListenerConfig{
 		Addr:      addr,
-		TLSConfig: tlsCfg,
+		TLSConfig: reloader.TLSConfig(),
 		Registry:  registry,
 		Log:       log,
 	})
@@ -500,12 +536,15 @@ func loadUserCA() (gossh.PublicKey, error) {
 //     key. The pubkey must be authorized on every target.
 //
 // Exactly one must be configured; both empty fails fast at startup.
-func loadClientSignerFunc(log *slog.Logger) (func(context.Context, string) (gossh.Signer, error), error) {
+func loadClientSignerFunc(log *slog.Logger, reloader *certdClientReloader) (func(context.Context, string) (gossh.Signer, error), error) {
 	if url := os.Getenv("CERTD_URL"); url != "" {
 		if os.Getenv("SSH_PROXYD_CLIENT_KEY") != "" {
 			log.Warn("CERTD_URL is set — ignoring SSH_PROXYD_CLIENT_KEY")
 		}
-		return newCertdMinter(url, log)
+		if reloader == nil {
+			return nil, errors.New("certd-client reloader is required when CERTD_URL is set")
+		}
+		return newCertdMinter(url, log, reloader)
 	}
 	path := os.Getenv("SSH_PROXYD_CLIENT_KEY")
 	if path == "" {
@@ -524,14 +563,9 @@ func loadClientSignerFunc(log *slog.Logger) (func(context.Context, string) (goss
 // returned func generates a fresh Ed25519 keypair, asks certd to
 // sign a user cert for the requested principal with a short TTL,
 // and returns the ready-to-use [gossh.Signer].
-func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, string) (gossh.Signer, error), error) {
-	tlsCfg, notAfter, err := loadCertdMTLS()
-	if err != nil {
-		return nil, err
-	}
-	warnIfCertdCertNearExpiry(log, notAfter)
-	remainingAttrs := workloadRemainingAttrsFor(notAfter)
-	client, err := certclient.NewClient(certdURL, tlsCfg)
+func newCertdMinter(certdURL string, log *slog.Logger, reloader *certdClientReloader) (func(context.Context, string) (gossh.Signer, error), error) {
+	remainingAttrs := workloadRemainingAttrsFor(reloader)
+	client, err := certclient.NewClient(certdURL, reloader.TLSConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -610,50 +644,297 @@ func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, st
 	}, nil
 }
 
-// loadCertdMTLS builds the *tls.Config presented to certd. The proxy
-// authenticates with its workload identity cert; certd's role table
-// maps the cert principal to a role that allows session minting.
+// DefaultCAPollInterval matches the value used by cert-agentd and
+// ssh-tunneld; one number for operators to remember across the
+// platform.
+const DefaultCAPollInterval = 30 * time.Second
+
+// certdClientReloader owns the TLS material ssh-proxyd presents to
+// certd (per-session sign-user calls + the revocation-snapshot
+// poller). Cert+key are loaded once at startup; the CA bundle is
+// mtime-polled by [certdClientReloader.RunCAPoll] so operators can
+// drop in a rotated bundle (typically an [OLD, NEW] overlap) without
+// restarting the proxy.
 //
-// Returns the loaded leaf's NotAfter alongside the config so callers
-// can surface remaining validity in startup + failure logs. The
-// in-memory cert is never refreshed (no GetClientCertificate
-// reloader yet); the returned timestamp reflects what the proxy
-// will keep presenting until the process restarts.
-func loadCertdMTLS() (*tls.Config, time.Time, error) {
-	certFile := os.Getenv("CERTD_MTLS_CERT")
-	keyFile := os.Getenv("CERTD_MTLS_KEY")
-	caBundle := os.Getenv("CERTD_CA_BUNDLE")
-	if certFile == "" || keyFile == "" {
-		return nil, time.Time{}, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
+// When CERTD_CA_BUNDLE is empty the reloader falls back to the
+// system pool — preserved for the dev path that doesn't pin trust.
+// In that mode RunCAPoll is a no-op.
+type certdClientReloader struct {
+	certPath, keyPath, caPath string
+
+	mu       sync.RWMutex
+	cert     *tls.Certificate
+	notAfter time.Time
+	pool     *x509.CertPool
+	caMtime  time.Time
+}
+
+func newCertdClientReloader(certPath, keyPath, caPath string) (*certdClientReloader, error) {
+	if certPath == "" || keyPath == "" {
+		return nil, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
 	}
-	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	r := &certdClientReloader{certPath: certPath, keyPath: keyPath, caPath: caPath}
+	if err := r.refreshCert(); err != nil {
+		return nil, err
+	}
+	if caPath == "" {
+		sys, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system cert pool: %w", err)
+		}
+		r.mu.Lock()
+		r.pool = sys
+		r.mu.Unlock()
+	} else if err := r.refreshCABundle(); err != nil {
+		return nil, fmt.Errorf("initial CA bundle: %w", err)
+	}
+	return r, nil
+}
+
+func (r *certdClientReloader) refreshCert() error {
+	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("load client cert pair: %w", err)
+		return fmt.Errorf("load certd-client cert pair: %w", err)
 	}
 	var notAfter time.Time
 	if len(keyPair.Certificate) > 0 {
 		leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
 		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("parse certd-client leaf %s: %w", certFile, err)
+			return fmt.Errorf("parse certd-client leaf %s: %w", r.certPath, err)
 		}
+		keyPair.Leaf = leaf
 		notAfter = leaf.NotAfter
 	}
-	cfg := &tls.Config{
-		Certificates: []tls.Certificate{keyPair},
-		MinVersion:   tls.VersionTLS12,
+	r.mu.Lock()
+	r.cert = &keyPair
+	r.notAfter = notAfter
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *certdClientReloader) refreshCABundle() error {
+	pool, mtime, err := readPoolIfChanged(r.caPath, r.caMtime, func() bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.pool != nil
+	})
+	if err != nil || pool == nil {
+		return err
 	}
-	if caBundle != "" {
-		pem, err := os.ReadFile(caBundle)
+	r.mu.Lock()
+	r.pool = pool
+	r.caMtime = mtime
+	r.mu.Unlock()
+	return nil
+}
+
+// RunCAPoll ticks every interval and reloads the CA bundle on mtime
+// advance. No-op (returns nil immediately) when caPath is empty,
+// since the system pool can't be hot-reloaded from this surface.
+// Returns when ctx is cancelled.
+func (r *certdClientReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
+	if r.caPath == "" {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if interval <= 0 {
+		interval = DefaultCAPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := r.refreshCABundle(); err != nil {
+				log.Warn("certd-client CA reload failed; keeping previous pool", "path", r.caPath, "err", err)
+			}
+		}
+	}
+}
+
+func (r *certdClientReloader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.cert == nil {
+		return nil, errors.New("certdClientReloader: no cert loaded yet")
+	}
+	return r.cert, nil
+}
+
+func (r *certdClientReloader) VerifyConnection(cs tls.ConnectionState) error {
+	r.mu.RLock()
+	pool := r.pool
+	r.mu.RUnlock()
+	if pool == nil {
+		return errors.New("certdClientReloader: no CA pool loaded")
+	}
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("certdClientReloader: peer presented no certificates")
+	}
+	opts := x509.VerifyOptions{
+		Roots:         pool,
+		DNSName:       cs.ServerName,
+		Intermediates: x509.NewCertPool(),
+	}
+	for _, cert := range cs.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+	_, err := cs.PeerCertificates[0].Verify(opts)
+	return err
+}
+
+// TLSConfig returns the *tls.Config the certclient HTTP transport
+// uses. InsecureSkipVerify + VerifyConnection so the standard
+// verifier — which freezes RootCAs at config-construction time —
+// doesn't compete with hot-reload semantics.
+func (r *certdClientReloader) TLSConfig() *tls.Config {
+	return &tls.Config{
+		GetClientCertificate: r.GetClientCertificate,
+		InsecureSkipVerify:   true,
+		VerifyConnection:     r.VerifyConnection,
+		MinVersion:           tls.VersionTLS12,
+	}
+}
+
+func (r *certdClientReloader) LeafExpiry() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.notAfter
+}
+
+// tunnelServerReloader owns the TLS material ssh-proxyd presents on
+// its inbound tunnel listener (server cert) plus the CA pool that
+// verifies each connecting ssh-tunneld (ClientCAs). Server cert is
+// loaded once at startup; the ClientCAs bundle is mtime-polled.
+// Verification uses the standard verifier (ClientAuth =
+// RequireAndVerifyClientCert) via [GetConfigForClient] returning a
+// freshly-built config per inbound connection — that's the
+// canonical Go idiom for hot-reloading ClientCAs without
+// disabling the standard chain verifier.
+type tunnelServerReloader struct {
+	certPath, keyPath, clientCAPath string
+
+	mu            sync.RWMutex
+	cert          *tls.Certificate
+	clientCAPool  *x509.CertPool
+	clientCAMtime time.Time
+}
+
+func newTunnelServerReloader(certPath, keyPath, clientCAPath string) (*tunnelServerReloader, error) {
+	r := &tunnelServerReloader{certPath: certPath, keyPath: keyPath, clientCAPath: clientCAPath}
+	if err := r.refreshCert(); err != nil {
+		return nil, err
+	}
+	if err := r.refreshClientCAs(); err != nil {
+		return nil, fmt.Errorf("initial tunnel client CA: %w", err)
+	}
+	return r, nil
+}
+
+func (r *tunnelServerReloader) refreshCert() error {
+	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	if err != nil {
+		return fmt.Errorf("load tunnel server cert: %w", err)
+	}
+	if len(keyPair.Certificate) > 0 {
+		leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
 		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("read CERTD_CA_BUNDLE: %w", err)
+			return fmt.Errorf("parse tunnel server leaf %s: %w", r.certPath, err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, time.Time{}, fmt.Errorf("CERTD_CA_BUNDLE %s contains no PEM certs", caBundle)
-		}
-		cfg.RootCAs = pool
+		keyPair.Leaf = leaf
 	}
-	return cfg, notAfter, nil
+	r.mu.Lock()
+	r.cert = &keyPair
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *tunnelServerReloader) refreshClientCAs() error {
+	pool, mtime, err := readPoolIfChanged(r.clientCAPath, r.clientCAMtime, func() bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.clientCAPool != nil
+	})
+	if err != nil || pool == nil {
+		return err
+	}
+	r.mu.Lock()
+	r.clientCAPool = pool
+	r.clientCAMtime = mtime
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *tunnelServerReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
+	if interval <= 0 {
+		interval = DefaultCAPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := r.refreshClientCAs(); err != nil {
+				log.Warn("tunnel client CA reload failed; keeping previous pool", "path", r.clientCAPath, "err", err)
+			}
+		}
+	}
+}
+
+// TLSConfig returns the outer *tls.Config the listener installs.
+// GetConfigForClient delivers a freshly-built per-connection config
+// with the latest cert + pool so a rotated ClientCAs file takes
+// effect within one poll interval, without disrupting in-flight
+// connections.
+func (r *tunnelServerReloader) TLSConfig() *tls.Config {
+	return &tls.Config{
+		GetConfigForClient: r.serverConfigForClient,
+		MinVersion:         tls.VersionTLS12,
+	}
+}
+
+func (r *tunnelServerReloader) serverConfigForClient(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+	r.mu.RLock()
+	cert := r.cert
+	pool := r.clientCAPool
+	r.mu.RUnlock()
+	if cert == nil || pool == nil {
+		return nil, errors.New("tunnelServerReloader: TLS material not loaded")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// readPoolIfChanged returns (newPool, newMtime, nil) when the file's
+// mtime has advanced past prevMtime OR alreadyLoaded() returns false
+// (the initial-load case). Returns (nil, _, nil) when the file is
+// unchanged — caller treats this as a no-op. Shared by both
+// reloaders so the mtime + parse logic stays in one place.
+func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, time.Time, error) {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !stat.ModTime().After(prevMtime) && alreadyLoaded() {
+		return nil, time.Time{}, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
+	}
+	return pool, stat.ModTime(), nil
 }
 
 // loadSSHPrivateKey reads any supported private key file and returns

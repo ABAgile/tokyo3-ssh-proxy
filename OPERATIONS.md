@@ -159,9 +159,40 @@ for the time range.
 At startup, if the loaded certd-client mTLS cert is within 24h of
 expiry, ssh-proxyd emits a one-shot warn:
 `certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation`.
-The in-memory cert is loaded once and never refreshed in-process,
-so an external rotation (cert-agentd, manual replace) needs a
-restart to take effect.
+
+### CA-bundle rotation (zero-restart)
+
+ssh-proxyd has two independent TLS surfaces, each with its own
+bundle that's mtime-polled every 30s by a dedicated goroutine.
+Operators can drop in a new bundle on either path without
+restarting the proxy; read failures keep the previous pool live
+and log warn (`certd-client CA reload failed; …` or
+`tunnel client CA reload failed; …`) so a corrupt drop-in never
+opens a trust window.
+
+| Bundle env var                                  | Used for                                              | Pattern                                            |
+|-------------------------------------------------|-------------------------------------------------------|----------------------------------------------------|
+| `CERTD_CA_BUNDLE`                               | verifying certd's server cert (minter + revchecker)   | InsecureSkipVerify + VerifyConnection              |
+| `SSH_PROXYD_TUNNEL_CLIENT_CA` (or `_WORKLOAD_CA`)| verifying inbound ssh-tunneld client certs            | GetConfigForClient → fresh tls.Config per handshake |
+
+The certd-client face uses the same InsecureSkipVerify +
+VerifyConnection pattern as cert-agentd / ssh-tunneld so each
+handshake reads the *current* pool snapshot. The tunnel-listener
+face uses GetConfigForClient (the canonical Go idiom for server-
+side hot-reload of ClientCAs) so the standard chain verifier
+stays in the path with a freshly-supplied pool per inbound
+connection.
+
+Rotation workflow follows the same shape as cert-agentd's:
+
+1. Drop `[OLD, NEW]` bundle on the relevant path. Wait ≥30s +
+   safety margin for the poller to fire.
+2. Switch certd's signing key from OLD to NEW (still requires a
+   certd restart — see ca/OPERATIONS.md §4).
+3. Wait for cert-agentd's normal renewal cadence to roll every
+   workload onto NEW-signed leafs.
+4. Drop `[NEW]` bundle. Trust set narrows back to single-CA on
+   the next mtime poll.
 
 ### Restart ssh-proxyd
 
