@@ -1,5 +1,5 @@
-github.com/abagile/tokyo3-base v0.5.1 h1:GSd3/i8Sxn8TfLEOWYZkFK3LtQc18+jIYSskjloJVuk=
-github.com/abagile/tokyo3-base v0.5.1/go.mod h1:2stdSbYq7sGgDpYKzYokiyrWBL3MmSSshWPDyswd5kM=
+github.com/abagile/tokyo3-base v0.5.3 h1:c/LxMeWSVw92MW69PiWb17bnm6wxgclKjtHsuDTiFmA=
+github.com/abagile/tokyo3-base v0.5.3/go.mod h1:2stdSbYq7sGgDpYKzYokiyrWBL3MmSSshWPDyswd5kM=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

@@ -61,6 +61,12 @@
 //	                         SSH_TUNNELD_TLS_KEY.
 //	SSH_TUNNELD_NATS_CA      CA bundle that signs the NATS server cert.
 //	                         Defaults to SSH_TUNNELD_TLS_CA.
+//	SSH_TUNNELD_INSTANCE     Per-host identifier appended to the NATS
+//	                         subject and added as an "instance" log
+//	                         attribute on every line. Defaults to
+//	                         os.Hostname(). Override when hostnames
+//	                         aren't stable or distinguishable across
+//	                         the fleet (e.g., Kubernetes pod names).
 package main
 
 import (
@@ -81,8 +87,6 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
-	bnats "github.com/abagile/tokyo3-base/nats"
-	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
@@ -122,7 +126,15 @@ func runCmd() *cobra.Command {
 }
 
 func runAgent(ctx context.Context) error {
-	log, drainLog := newAppLogger()
+	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{
+		App:      appName,
+		Instance: envOr("SSH_TUNNELD_INSTANCE", hostnameOrEmpty()),
+	}, applog.NATSConfig{
+		URL:      os.Getenv("SSH_TUNNELD_NATS_URL"),
+		CertFile: envFirst("SSH_TUNNELD_NATS_CERT", "SSH_TUNNELD_TLS_CERT"),
+		KeyFile:  envFirst("SSH_TUNNELD_NATS_KEY", "SSH_TUNNELD_TLS_KEY"),
+		CAFile:   envFirst("SSH_TUNNELD_NATS_CA", "SSH_TUNNELD_TLS_CA"),
+	}, applog.WithStdout())
 	defer drainLog()
 
 	proxyAddr := mustEnv("SSH_TUNNELD_PROXY_ADDR")
@@ -239,67 +251,6 @@ func versionCmd() *cobra.Command {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// openLogNATS dials a NATS connection used by applog's WithAsyncNats
-// writer to ship operational log lines on subject "app_log.ssh-tunneld".
-// CERT / KEY / CA default to the workload-identity material the agent
-// already uses for the proxy connection, so a single set of TLS files
-// covers both purposes. Returns (nil, nil) when SSH_TUNNELD_NATS_URL
-// is unset.
-//
-// RetryOnFailedConnect + unbounded MaxReconnects mean a broker that's
-// down at boot doesn't permanently disable log shipping for the
-// process lifetime — entries get dropped (AsyncWriter is
-// discard-on-full) while disconnected, and shipping auto-resumes
-// once NATS comes back.
-func openLogNATS() (*nats.Conn, error) {
-	url := os.Getenv("SSH_TUNNELD_NATS_URL")
-	if url == "" {
-		return nil, nil
-	}
-	nc, err := bnats.Dial(url,
-		envFirst("SSH_TUNNELD_NATS_CERT", "SSH_TUNNELD_TLS_CERT"),
-		envFirst("SSH_TUNNELD_NATS_KEY", "SSH_TUNNELD_TLS_KEY"),
-		envFirst("SSH_TUNNELD_NATS_CA", "SSH_TUNNELD_TLS_CA"),
-		nats.Timeout(1*time.Second),
-		nats.DrainTimeout(500*time.Millisecond),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("log shipping: %w", err)
-	}
-	return nc, nil
-}
-
-// newAppLogger builds the structured logger for ssh-tunneld. Ships
-// log lines async to NATS subject "app_log.ssh-tunneld" when
-// SSH_TUNNELD_NATS_URL is set; otherwise stdout-only. Returns the
-// logger plus a drain callback the caller defers — no-op when log
-// shipping is disabled.
-func newAppLogger() (*slog.Logger, func()) {
-	logNATS, logNATSErr := openLogNATS()
-	drain := func() {}
-	if logNATS != nil {
-		drain = func() { _ = logNATS.Drain() }
-	}
-	writerOpts := []applog.WriterOption{applog.WithStdout()}
-	if logNATS != nil {
-		writerOpts = append(writerOpts, applog.WithAsyncNats(logNATS))
-	}
-	log, _ := applog.AppLogger(appName, writerOpts...)
-	if logNATSErr != nil {
-		log.Warn("operational log shipping disabled", "err", logNATSErr)
-	} else if logNATS != nil {
-		// "configured" rather than "shipping" — RetryOnFailedConnect
-		// means the connection may still be establishing in the
-		// background; entries get dropped (AsyncWriter is
-		// discard-on-full) until it does.
-		log.Info("operational log shipping configured", "subject", "app_log."+appName)
-	}
-	return log, drain
-}
-
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -323,6 +274,19 @@ func envFirst(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// hostnameOrEmpty returns os.Hostname() on success and "" on error.
+// Used as the default for SSH_TUNNELD_INSTANCE so the NATS subject
+// hierarchy picks up a sensible per-host suffix without any
+// operator action; the empty fallback keeps the helper at its
+// legacy singleton-subject shape when the OS refuses to answer.
+func hostnameOrEmpty() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // tlsReloader owns the in-process TLS state ssh-tunneld presents to
