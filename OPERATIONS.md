@@ -224,6 +224,35 @@ At startup, if the loaded workload cert is within 24h of expiry,
 the agent emits a one-shot warn:
 `workload mTLS cert near expiry — restart ssh-tunneld after the next rotation`.
 
+### CA-bundle rotation (zero-restart)
+
+`SSH_TUNNELD_TLS_CA` (proxy face) and `SSH_TUNNELD_CERTD_CA` (certd
+face) are independently mtime-polled every 30s. Operators can drop
+in a new bundle on either path (typically `[OLD, NEW]` during a
+rotation overlap window) and the agent picks it up on the next
+tick — no restart required. Read failures keep the previous pool
+live and log warn (`proxy CA reload failed; keeping previous pool`
+or `certd CA reload failed; …`) so a corrupt drop-in never opens
+a trust window.
+
+The TLS material the agent presents on both faces uses
+`InsecureSkipVerify + VerifyConnection` rather than the standard
+verifier so each handshake reads the *current* pool snapshot
+rather than the one captured at config-construction time;
+hostname + chain verification still run inside the callback.
+
+Rotation workflow follows the same shape as cert-agentd:
+
+1. Drop `[OLD, NEW]` bundle on every host (both faces if rotating
+   the shared CA; just the relevant face if rotating separately).
+   Wait ≥30s + safety margin for every agent's poll to fire.
+2. Switch certd's signing key from OLD to NEW (requires a certd
+   restart — see ca/OPERATIONS.md §4).
+3. Wait for cert-agentd's normal renewal cadence to roll every
+   workload onto NEW-signed leafs.
+4. Drop `[NEW]` bundle on every host. Trust set narrows back to
+   single-CA on the next mtime poll.
+
 ### What happens when the local sshd restarts
 
 The forwarder's per-stream dial fails for in-flight streams; those
