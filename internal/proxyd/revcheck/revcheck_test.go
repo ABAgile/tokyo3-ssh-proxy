@@ -160,6 +160,28 @@ func TestPollingChecker_KeepsLastGoodSnapshotOnFetchFailure(t *testing.T) {
 	}
 }
 
+func TestPollingChecker_AppendsRefreshErrorAttrs(t *testing.T) {
+	srv := newSnapshotServer(t)
+	srv.setStatus(http.StatusInternalServerError)
+
+	var hookCalls atomic.Int32
+	pc, _ := revcheck.NewPollingChecker(revcheck.Config{
+		URL:          srv.server.URL,
+		PollInterval: 20 * time.Millisecond,
+		RefreshErrorAttrs: func() []any {
+			hookCalls.Add(1)
+			return []any{"workload_cert_remaining", time.Hour}
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = pc.Run(ctx)
+
+	if got := hookCalls.Load(); got < 2 {
+		t.Errorf("RefreshErrorAttrs invocations = %d, want ≥ 2 (one per failed fetch)", got)
+	}
+}
+
 func TestPollingChecker_HandlesEmptySnapshot(t *testing.T) {
 	srv := newSnapshotServer(t)
 	srv.set(revcheck.Snapshot{}) // no Entries

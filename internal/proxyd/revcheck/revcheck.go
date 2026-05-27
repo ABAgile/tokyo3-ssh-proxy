@@ -63,10 +63,11 @@ type Revocation struct {
 // resulting set as a [Checker]. Safe for concurrent IsRevoked reads
 // while Run is in flight.
 type PollingChecker struct {
-	url    string
-	client *http.Client
-	log    *slog.Logger
-	period time.Duration
+	url             string
+	client          *http.Client
+	log             *slog.Logger
+	period          time.Duration
+	refreshErrAttrs func() []any
 
 	mu            sync.RWMutex
 	bySerial      map[uint64]Revocation
@@ -96,6 +97,15 @@ type Config struct {
 
 	// Log is the structured logger. nil ⇒ slog.Default.
 	Log *slog.Logger
+
+	// RefreshErrorAttrs, if set, returns extra structured fields the
+	// poller appends to its per-failure "revocation refresh failed"
+	// warn line. Use this to surface caller-specific context (e.g.,
+	// remaining validity on the mTLS material the proxy presents to
+	// certd) without coupling this package to the caller's
+	// bootstrap concepts. Called once per failed fetch inside Run,
+	// before the next tick. Nil ⇒ no extra fields.
+	RefreshErrorAttrs func() []any
 }
 
 // Defaults — chosen for the same reasons certd's own caching
@@ -122,12 +132,13 @@ func NewPollingChecker(cfg Config) (*PollingChecker, error) {
 		cfg.Log = slog.Default()
 	}
 	return &PollingChecker{
-		url:      cfg.URL,
-		client:   &http.Client{Timeout: cfg.HTTPTimeout, Transport: &http.Transport{TLSClientConfig: cfg.TLSConfig}},
-		log:      cfg.Log,
-		period:   cfg.PollInterval,
-		bySerial: make(map[uint64]Revocation),
-		byKeyID:  make(map[string]Revocation),
+		url:             cfg.URL,
+		client:          &http.Client{Timeout: cfg.HTTPTimeout, Transport: &http.Transport{TLSClientConfig: cfg.TLSConfig}},
+		log:             cfg.Log,
+		period:          cfg.PollInterval,
+		refreshErrAttrs: cfg.RefreshErrorAttrs,
+		bySerial:        make(map[uint64]Revocation),
+		byKeyID:         make(map[string]Revocation),
 	}, nil
 }
 
@@ -191,8 +202,11 @@ func (p *PollingChecker) refresh(ctx context.Context) {
 		p.mu.Lock()
 		p.lastFetchErr = err
 		p.mu.Unlock()
-		p.log.Warn("revocation refresh failed; keeping previous snapshot",
-			"url", p.url, "err", err)
+		args := []any{"url", p.url, "err", err}
+		if p.refreshErrAttrs != nil {
+			args = append(args, p.refreshErrAttrs()...)
+		}
+		p.log.Warn("revocation refresh failed; keeping previous snapshot", args...)
 		return
 	}
 	bySerial := make(map[uint64]Revocation, len(snap.Entries))

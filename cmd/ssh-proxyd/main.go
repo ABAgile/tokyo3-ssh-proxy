@@ -129,6 +129,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -298,10 +299,11 @@ func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) 
 		log.Warn("CERTD_REVOCATIONS_URL unset — revocation checking disabled (revoked certs will still be accepted)")
 		return nil, nil
 	}
-	tlsCfg, err := loadCertdMTLS()
+	tlsCfg, notAfter, err := loadCertdMTLS()
 	if err != nil {
 		return nil, fmt.Errorf("revocation mTLS: %w", err)
 	}
+	warnIfCertdCertNearExpiry(log, notAfter)
 	period := DefaultRevocationPollInterval
 	if v := os.Getenv("CERTD_REVOCATIONS_POLL_SECONDS"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -311,16 +313,57 @@ func buildRevocationChecker(log *slog.Logger) (*revcheck.PollingChecker, error) 
 		period = time.Duration(n) * time.Second
 	}
 	checker, err := revcheck.NewPollingChecker(revcheck.Config{
-		URL:          url,
-		TLSConfig:    tlsCfg,
-		PollInterval: period,
-		Log:          log,
+		URL:               url,
+		TLSConfig:         tlsCfg,
+		PollInterval:      period,
+		Log:               log,
+		RefreshErrorAttrs: workloadRemainingAttrsFor(notAfter),
 	})
 	if err != nil {
 		return nil, err
 	}
 	log.Info("revocation polling enabled", "url", url, "interval", period)
 	return checker, nil
+}
+
+// certdCertWarnOnce ensures the startup near-expiry warn fires at
+// most once even when both certd-touching surfaces (revcheck poller
+// and per-session minter) load the same cert.
+var certdCertWarnOnce sync.Once
+
+// warnIfCertdCertNearExpiry emits the one-shot startup warn if the
+// loaded certd-client cert is within 24h of expiry. Called from the
+// two places that build a certd HTTP client (revocation poller and
+// per-session minter); sync.Once dedupes the message.
+func warnIfCertdCertNearExpiry(log *slog.Logger, notAfter time.Time) {
+	if notAfter.IsZero() {
+		return
+	}
+	remaining := time.Until(notAfter)
+	if remaining >= 24*time.Hour {
+		return
+	}
+	certdCertWarnOnce.Do(func() {
+		log.Warn("certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation",
+			"remaining", remaining.Round(time.Second),
+			"not_after", notAfter)
+	})
+}
+
+// workloadRemainingAttrsFor returns the closure both the revcheck
+// poller and the minter wrap their failure logs with, so operators
+// see a uniform workload_cert_remaining field on every certd-side
+// failure regardless of which surface produced it. The closure
+// captures notAfter by value at startup; today the cert is loaded
+// once and never refreshed in-process, so the timestamp is stable
+// across the lifetime of the process.
+func workloadRemainingAttrsFor(notAfter time.Time) func() []any {
+	if notAfter.IsZero() {
+		return nil
+	}
+	return func() []any {
+		return []any{"workload_cert_remaining", time.Until(notAfter).Round(time.Second)}
+	}
 }
 
 // DefaultRevocationPollInterval matches revcheck.DefaultPollInterval.
@@ -476,10 +519,12 @@ func loadClientSignerFunc(log *slog.Logger) (func(context.Context, string) (goss
 // sign a user cert for the requested principal with a short TTL,
 // and returns the ready-to-use [gossh.Signer].
 func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, string) (gossh.Signer, error), error) {
-	tlsCfg, err := loadCertdMTLS()
+	tlsCfg, notAfter, err := loadCertdMTLS()
 	if err != nil {
 		return nil, err
 	}
+	warnIfCertdCertNearExpiry(log, notAfter)
+	remainingAttrs := workloadRemainingAttrsFor(notAfter)
 	client, err := certclient.NewClient(certdURL, tlsCfg)
 	if err != nil {
 		return nil, err
@@ -493,7 +538,7 @@ func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, st
 		ttl = n
 	}
 	log.Info("certd session minting enabled", "url", certdURL, "ttl_seconds", ttl)
-	return func(ctx context.Context, principal string) (gossh.Signer, error) {
+	mint := func(ctx context.Context, principal string) (gossh.Signer, error) {
 		// Fresh Ed25519 keypair per session — never reused, never
 		// persisted. The cert lives only as long as the session.
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -541,22 +586,51 @@ func newCertdMinter(certdURL string, log *slog.Logger) (func(context.Context, st
 			"valid_before", resp.ValidBefore,
 		)
 		return certSigner, nil
+	}
+	if remainingAttrs == nil {
+		return mint, nil
+	}
+	// Wrap mint so failures emit workload_cert_remaining. The
+	// underlying error is returned unchanged so the SSH server's
+	// existing auth-failure handling stays intact.
+	return func(ctx context.Context, principal string) (gossh.Signer, error) {
+		signer, err := mint(ctx, principal)
+		if err != nil {
+			args := []any{"principal", principal, "err", err}
+			args = append(args, remainingAttrs()...)
+			log.Warn("certd session minting failed", args...)
+		}
+		return signer, err
 	}, nil
 }
 
 // loadCertdMTLS builds the *tls.Config presented to certd. The proxy
 // authenticates with its workload identity cert; certd's role table
 // maps the cert principal to a role that allows session minting.
-func loadCertdMTLS() (*tls.Config, error) {
+//
+// Returns the loaded leaf's NotAfter alongside the config so callers
+// can surface remaining validity in startup + failure logs. The
+// in-memory cert is never refreshed (no GetClientCertificate
+// reloader yet); the returned timestamp reflects what the proxy
+// will keep presenting until the process restarts.
+func loadCertdMTLS() (*tls.Config, time.Time, error) {
 	certFile := os.Getenv("CERTD_MTLS_CERT")
 	keyFile := os.Getenv("CERTD_MTLS_KEY")
 	caBundle := os.Getenv("CERTD_CA_BUNDLE")
 	if certFile == "" || keyFile == "" {
-		return nil, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
+		return nil, time.Time{}, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
 	}
 	keyPair, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("load client cert pair: %w", err)
+		return nil, time.Time{}, fmt.Errorf("load client cert pair: %w", err)
+	}
+	var notAfter time.Time
+	if len(keyPair.Certificate) > 0 {
+		leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("parse certd-client leaf %s: %w", certFile, err)
+		}
+		notAfter = leaf.NotAfter
 	}
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{keyPair},
@@ -565,15 +639,15 @@ func loadCertdMTLS() (*tls.Config, error) {
 	if caBundle != "" {
 		pem, err := os.ReadFile(caBundle)
 		if err != nil {
-			return nil, fmt.Errorf("read CERTD_CA_BUNDLE: %w", err)
+			return nil, time.Time{}, fmt.Errorf("read CERTD_CA_BUNDLE: %w", err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("CERTD_CA_BUNDLE %s contains no PEM certs", caBundle)
+			return nil, time.Time{}, fmt.Errorf("CERTD_CA_BUNDLE %s contains no PEM certs", caBundle)
 		}
 		cfg.RootCAs = pool
 	}
-	return cfg, nil
+	return cfg, notAfter, nil
 }
 
 // loadSSHPrivateKey reads any supported private key file and returns
@@ -631,6 +705,7 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 		URL:     url,
 		Subject: audit.Subject,
 		TLS:     tlsCfg,
+		Log:     log,
 	})
 	if err != nil {
 		return nil, err

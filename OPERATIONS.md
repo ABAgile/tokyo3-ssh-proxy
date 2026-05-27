@@ -128,28 +128,40 @@ Walk down this list:
 
 ### Recover from a NATS outage
 
-ssh-proxy's audit publish is best-effort. Sessions keep flowing
-during the outage; events buffer in NATS's send queue (or are
-dropped if the queue overflows). After recovery:
-
-1. Confirm `SSH_PROXYD_NATS_URL` is reachable.
-2. Restart `ssh-proxyd` to reset the sink — there is no hot-reload.
-3. Note the gap window in certd's `/portal/audit` for the time
-   range.
+ssh-proxy's audit publish is best-effort. The audit sink uses the
+NATS client's async-reconnect (Retry on first failure +
+unbounded MaxReconnects + 2s ReconnectWait), so a broker outage
+neither blocks ssh-proxyd's startup nor crashes a running gateway —
+publish-time failures surface in `audit append failed` logs.
+Sessions keep flowing during the outage. After recovery the client
+reconnects automatically; there's no restart needed for the audit
+pipeline to resume. Note the gap window in certd's `/portal/audit`
+for the time range.
 
 ### Recover from a certd outage
 
 - **Sign endpoints unavailable** → per-session cert minting fails.
   Existing connections keep working; **new** sessions fail with
-  `channel.rejected stage=client_signer`. Restore certd then no
-  proxy restart needed.
+  `channel.rejected stage=client_signer`. The minter's failure log
+  carries `workload_cert_remaining=<duration>` so the
+  certd-client mTLS cert's own exhaustion shows up as a clearly-
+  labelled countdown rather than identical-looking error spam.
+  Restore certd then no proxy restart needed.
 - **Revocations endpoint unavailable** → the polling checker logs
-  `revocation refresh failed; keeping previous snapshot` at warn.
-  The proxy keeps refusing previously-revoked certs but won't
-  pick up new revocations until certd is back. Operators should
-  alert on `revocation refresh failed` log bursts.
+  `revocation refresh failed; keeping previous snapshot` at warn,
+  also carrying `workload_cert_remaining=<duration>`. The proxy
+  keeps refusing previously-revoked certs but won't pick up new
+  revocations until certd is back. Operators should alert on
+  `revocation refresh failed` log bursts.
 - **Tunnel listener doesn't care** about certd availability —
   tunneld → proxy mTLS handshakes don't go through certd.
+
+At startup, if the loaded certd-client mTLS cert is within 24h of
+expiry, ssh-proxyd emits a one-shot warn:
+`certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation`.
+The in-memory cert is loaded once and never refreshed in-process,
+so an external rotation (cert-agentd, manual replace) needs a
+restart to take effect.
 
 ### Restart ssh-proxyd
 
