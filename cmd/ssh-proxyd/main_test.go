@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
@@ -8,9 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,7 +67,7 @@ func TestCertdClientReloader_LoadsLeafExpiry(t *testing.T) {
 		t.Fatalf("write CA: %v", err)
 	}
 
-	r, err := newCertdClientReloader(certPath, keyPath, caPath)
+	r, err := newCertdClientReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newCertdClientReloader: %v", err)
 	}
@@ -79,7 +82,7 @@ func TestCertdClientReloader_FallsBackToSystemPoolWhenCAPathEmpty(t *testing.T) 
 	keyPath := filepath.Join(dir, "k.pem")
 	writePEMCertKey(t, certPath, keyPath, "ssh-proxyd", time.Now().Add(time.Hour))
 
-	r, err := newCertdClientReloader(certPath, keyPath, "")
+	r, err := newCertdClientReloader(certPath, keyPath, "", nil)
 	if err != nil {
 		t.Fatalf("newCertdClientReloader (empty CA): %v", err)
 	}
@@ -102,7 +105,7 @@ func TestCertdClientReloader_VerifyConnection(t *testing.T) {
 	if err := os.WriteFile(caPath, b, 0o644); err != nil {
 		t.Fatalf("write CA: %v", err)
 	}
-	r, err := newCertdClientReloader(certPath, keyPath, caPath)
+	r, err := newCertdClientReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newCertdClientReloader: %v", err)
 	}
@@ -146,7 +149,7 @@ func TestCertdClientReloader_RefreshCABundleOnMtimeChange(t *testing.T) {
 		t.Fatalf("write initial bundle: %v", err)
 	}
 
-	r, err := newCertdClientReloader(certPath, keyPath, caPath)
+	r, err := newCertdClientReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newCertdClientReloader: %v", err)
 	}
@@ -184,7 +187,7 @@ func TestTunnelServerReloader_ServerConfigForClient(t *testing.T) {
 		t.Fatalf("write CA: %v", err)
 	}
 
-	r, err := newTunnelServerReloader(certPath, keyPath, caPath)
+	r, err := newTunnelServerReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newTunnelServerReloader: %v", err)
 	}
@@ -219,7 +222,7 @@ func TestTunnelServerReloader_RefreshClientCAsOnMtimeChange(t *testing.T) {
 		t.Fatalf("write initial bundle: %v", err)
 	}
 
-	r, err := newTunnelServerReloader(certPath, keyPath, caPath)
+	r, err := newTunnelServerReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newTunnelServerReloader: %v", err)
 	}
@@ -241,5 +244,109 @@ func TestTunnelServerReloader_RefreshClientCAsOnMtimeChange(t *testing.T) {
 	}
 	if !r.clientCAMtime.After(initial) {
 		t.Errorf("clientCAMtime did not advance: %v → %v", initial, r.clientCAMtime)
+	}
+}
+
+// ── reload-log + cert mtime poll ──────────────────────────────────────────────
+
+// TestCertdClientReloader_LogsOnBundleReload asserts the info log
+// operators rely on for rotation coordination fires only when the
+// pool actually changes. No-op polls stay silent.
+func TestCertdClientReloader_LogsOnBundleReload(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	writePEMCertKey(t, certPath, keyPath, "ssh-proxyd", time.Now().Add(time.Hour))
+	caV1Path := filepath.Join(dir, "ca-v1.pem")
+	caV2Path := filepath.Join(dir, "ca-v2.pem")
+	writePEMCertKey(t, caV1Path, filepath.Join(dir, "ca-v1.key"), "ca-v1", time.Now().Add(time.Hour))
+	writePEMCertKey(t, caV2Path, filepath.Join(dir, "ca-v2.key"), "ca-v2", time.Now().Add(time.Hour))
+	caV1, _ := os.ReadFile(caV1Path)
+	caV2, _ := os.ReadFile(caV2Path)
+	if err := os.WriteFile(caPath, caV1, 0o644); err != nil {
+		t.Fatalf("write initial bundle: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	r, err := newCertdClientReloader(certPath, keyPath, caPath, log)
+	if err != nil {
+		t.Fatalf("newCertdClientReloader: %v", err)
+	}
+	if got := strings.Count(buf.String(), "certd-client cert reloaded"); got != 1 {
+		t.Errorf("cert reload count = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "certd-client CA bundle reloaded"); got != 1 {
+		t.Errorf("CA reload count = %d, want 1", got)
+	}
+	wantFP := bundleFingerprint(caV1)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP) {
+		t.Errorf("missing fingerprint=%s; got:\n%s", wantFP, buf.String())
+	}
+
+	buf.Reset()
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle (no-op): %v", err)
+	}
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert (no-op): %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no-op polls logged: %s", buf.String())
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	expanded := append(caV1, caV2...)
+	if err := os.WriteFile(caPath, expanded, 0o644); err != nil {
+		t.Fatalf("write expanded bundle: %v", err)
+	}
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle: %v", err)
+	}
+	wantFP2 := bundleFingerprint(expanded)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP2) {
+		t.Errorf("expected log with fingerprint=%s; got:\n%s", wantFP2, buf.String())
+	}
+}
+
+// TestCertdClientReloader_RefreshCertOnMtimeChange asserts the cert
+// mtime gate: a fresh cert on disk picks up via refreshCert; a
+// no-op call stays silent + leaves state unchanged.
+func TestCertdClientReloader_RefreshCertOnMtimeChange(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	wantExpiry1 := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	writePEMCertKey(t, certPath, keyPath, "ssh-proxyd", wantExpiry1)
+	b, _ := os.ReadFile(certPath)
+	if err := os.WriteFile(caPath, b, 0o644); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+
+	r, err := newCertdClientReloader(certPath, keyPath, caPath, nil)
+	if err != nil {
+		t.Fatalf("newCertdClientReloader: %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry1) {
+		t.Errorf("initial LeafExpiry = %v, want %v", r.LeafExpiry(), wantExpiry1)
+	}
+
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert (no-op): %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry1) {
+		t.Errorf("LeafExpiry changed after no-op refresh: %v", r.LeafExpiry())
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	wantExpiry2 := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	writePEMCertKey(t, certPath, keyPath, "ssh-proxyd", wantExpiry2)
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert: %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry2) {
+		t.Errorf("after refresh: LeafExpiry = %v, want %v", r.LeafExpiry(), wantExpiry2)
 	}
 }

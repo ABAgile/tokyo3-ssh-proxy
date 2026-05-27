@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
@@ -8,9 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,7 +68,7 @@ func TestNewTLSReloader_LoadsLeafExpiry(t *testing.T) {
 		t.Fatalf("write CA: %v", err)
 	}
 
-	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "proxy.example.com")
+	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "proxy.example.com", nil)
 	if err != nil {
 		t.Fatalf("newTLSReloader: %v", err)
 	}
@@ -94,7 +97,7 @@ func TestTLSReloader_RefreshProxyCAOnMtimeChange(t *testing.T) {
 		t.Fatalf("write initial bundle: %v", err)
 	}
 
-	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "proxy")
+	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "proxy", nil)
 	if err != nil {
 		t.Fatalf("newTLSReloader: %v", err)
 	}
@@ -149,7 +152,7 @@ func TestTLSReloader_VerifyConnection(t *testing.T) {
 		t.Fatalf("write certd CA: %v", err)
 	}
 
-	r, err := newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, "agent")
+	r, err := newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, "agent", nil)
 	if err != nil {
 		t.Fatalf("newTLSReloader: %v", err)
 	}
@@ -185,5 +188,119 @@ func TestTLSReloader_VerifyConnection(t *testing.T) {
 	// Same leaf is NOT trusted by proxy pool.
 	if err := proxyCfg.VerifyConnection(csCertdTrusted); err == nil {
 		t.Error("proxy VerifyConnection should reject certd-ca cert (signed outside proxy bundle)")
+	}
+}
+
+// TestTLSReloader_LogsOnBundleReload asserts the info log
+// operators rely on for rotation coordination fires only when a
+// bundle actually swaps. No-op polls stay silent.
+func TestTLSReloader_LogsOnBundleReload(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	writePEMCertKey(t, certPath, keyPath, "agent", time.Now().Add(time.Hour))
+	caV1Path := filepath.Join(dir, "ca-v1.pem")
+	caV2Path := filepath.Join(dir, "ca-v2.pem")
+	writePEMCertKey(t, caV1Path, filepath.Join(dir, "ca-v1.key"), "ca-v1", time.Now().Add(time.Hour))
+	writePEMCertKey(t, caV2Path, filepath.Join(dir, "ca-v2.key"), "ca-v2", time.Now().Add(time.Hour))
+	caV1, _ := os.ReadFile(caV1Path)
+	caV2, _ := os.ReadFile(caV2Path)
+	if err := os.WriteFile(caPath, caV1, 0o644); err != nil {
+		t.Fatalf("write initial bundle: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "agent", log)
+	if err != nil {
+		t.Fatalf("newTLSReloader: %v", err)
+	}
+	// Constructor's initial load fires one cert log + two bundle
+	// logs (proxy + certd, both pointing at the same file).
+	if got := strings.Count(buf.String(), "workload cert reloaded"); got != 1 {
+		t.Errorf("workload cert reload count = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "proxy CA bundle reloaded"); got != 1 {
+		t.Errorf("proxy CA reload count = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "certd CA bundle reloaded"); got != 1 {
+		t.Errorf("certd CA reload count = %d, want 1", got)
+	}
+	wantFP := bundleFingerprint(caV1)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP) {
+		t.Errorf("constructor log missing fingerprint=%s; got:\n%s", wantFP, buf.String())
+	}
+
+	// No-op polls stay silent.
+	buf.Reset()
+	if err := r.refreshProxyCA(); err != nil {
+		t.Fatalf("refreshProxyCA (no-op): %v", err)
+	}
+	if err := r.refreshCertdCA(); err != nil {
+		t.Fatalf("refreshCertdCA (no-op): %v", err)
+	}
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert (no-op): %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no-op polls logged: %s", buf.String())
+	}
+
+	// Drop in expanded bundle — both proxy + certd reloads log
+	// with the new fingerprint, since they share caPath.
+	time.Sleep(1100 * time.Millisecond)
+	expanded := append(caV1, caV2...)
+	if err := os.WriteFile(caPath, expanded, 0o644); err != nil {
+		t.Fatalf("write expanded bundle: %v", err)
+	}
+	if err := r.refreshProxyCA(); err != nil {
+		t.Fatalf("refreshProxyCA: %v", err)
+	}
+	wantFP2 := bundleFingerprint(expanded)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP2) {
+		t.Errorf("expected log with fingerprint=%s; got:\n%s", wantFP2, buf.String())
+	}
+}
+
+// TestTLSReloader_RefreshCertOnMtimeChange asserts the cert mtime
+// gate: only re-reads + logs when the file on disk has advanced.
+func TestTLSReloader_RefreshCertOnMtimeChange(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	wantExpiry1 := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	writePEMCertKey(t, certPath, keyPath, "agent", wantExpiry1)
+	b, _ := os.ReadFile(certPath)
+	if err := os.WriteFile(caPath, b, 0o644); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+
+	r, err := newTLSReloader(certPath, keyPath, caPath, caPath, "agent", nil)
+	if err != nil {
+		t.Fatalf("newTLSReloader: %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry1) {
+		t.Errorf("initial LeafExpiry = %v, want %v", r.LeafExpiry(), wantExpiry1)
+	}
+
+	// Same file → no-op.
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert (no-op): %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry1) {
+		t.Errorf("LeafExpiry changed after no-op refresh: %v", r.LeafExpiry())
+	}
+
+	// New cert with later NotAfter; mtime advances.
+	time.Sleep(1100 * time.Millisecond)
+	wantExpiry2 := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	writePEMCertKey(t, certPath, keyPath, "agent", wantExpiry2)
+	if err := r.refreshCert(); err != nil {
+		t.Fatalf("refreshCert: %v", err)
+	}
+	if !r.LeafExpiry().Equal(wantExpiry2) {
+		t.Errorf("after refresh: LeafExpiry = %v, want %v", r.LeafExpiry(), wantExpiry2)
 	}
 }

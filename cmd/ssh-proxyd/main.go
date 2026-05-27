@@ -123,8 +123,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -229,6 +231,7 @@ func runServe(ctx context.Context) error {
 			os.Getenv("CERTD_MTLS_CERT"),
 			os.Getenv("CERTD_MTLS_KEY"),
 			os.Getenv("CERTD_CA_BUNDLE"),
+			log,
 		)
 		if err != nil {
 			return fmt.Errorf("certd-client tls: %w", err)
@@ -238,7 +241,7 @@ func runServe(ctx context.Context) error {
 
 	// Build the tunnel-server TLS reloader once when the listener
 	// is enabled. nil when SSH_PROXYD_TUNNEL_ADDR is unset.
-	tunnelReloader, err := newTunnelServerReloaderFromEnv()
+	tunnelReloader, err := newTunnelServerReloaderFromEnv(log)
 	if err != nil {
 		return fmt.Errorf("tunnel-server tls: %w", err)
 	}
@@ -296,14 +299,14 @@ func runServe(ctx context.Context) error {
 	// reloader was constructed (caught earlier).
 	if certdReloader != nil {
 		go func() {
-			if err := certdReloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
+			if err := certdReloader.RunPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("certd-client CA poller exited", "err", err)
 			}
 		}()
 	}
 	if tunnelReloader != nil {
 		go func() {
-			if err := tunnelReloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
+			if err := tunnelReloader.RunPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("tunnel client CA poller exited", "err", err)
 			}
 		}()
@@ -422,7 +425,7 @@ const DefaultRevocationPollInterval = 30 * time.Second
 // vars is shared between the reloader construction here and the
 // buildTunnelListener call below; SSH_PROXYD_TUNNEL_ADDR is treated
 // as the master switch.
-func newTunnelServerReloaderFromEnv() (*tunnelServerReloader, error) {
+func newTunnelServerReloaderFromEnv(log *slog.Logger) (*tunnelServerReloader, error) {
 	if os.Getenv("SSH_PROXYD_TUNNEL_ADDR") == "" {
 		return nil, nil
 	}
@@ -432,7 +435,7 @@ func newTunnelServerReloaderFromEnv() (*tunnelServerReloader, error) {
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
-	return newTunnelServerReloader(certFile, keyFile, caFile)
+	return newTunnelServerReloader(certFile, keyFile, caFile, log)
 }
 
 // buildTunnelListener returns the routing.Registry + Listener pair
@@ -652,7 +655,7 @@ const DefaultCAPollInterval = 30 * time.Second
 // certdClientReloader owns the TLS material ssh-proxyd presents to
 // certd (per-session sign-user calls + the revocation-snapshot
 // poller). Cert+key are loaded once at startup; the CA bundle is
-// mtime-polled by [certdClientReloader.RunCAPoll] so operators can
+// mtime-polled by [certdClientReloader.RunPoll] so operators can
 // drop in a rotated bundle (typically an [OLD, NEW] overlap) without
 // restarting the proxy.
 //
@@ -661,19 +664,24 @@ const DefaultCAPollInterval = 30 * time.Second
 // In that mode RunCAPoll is a no-op.
 type certdClientReloader struct {
 	certPath, keyPath, caPath string
+	log                       *slog.Logger
 
-	mu       sync.RWMutex
-	cert     *tls.Certificate
-	notAfter time.Time
-	pool     *x509.CertPool
-	caMtime  time.Time
+	mu        sync.RWMutex
+	cert      *tls.Certificate
+	notAfter  time.Time
+	certMtime time.Time
+	pool      *x509.CertPool
+	caMtime   time.Time
 }
 
-func newCertdClientReloader(certPath, keyPath, caPath string) (*certdClientReloader, error) {
+func newCertdClientReloader(certPath, keyPath, caPath string, log *slog.Logger) (*certdClientReloader, error) {
 	if certPath == "" || keyPath == "" {
 		return nil, errors.New("CERTD_MTLS_CERT and CERTD_MTLS_KEY are required when CERTD_URL is set")
 	}
-	r := &certdClientReloader{certPath: certPath, keyPath: keyPath, caPath: caPath}
+	if log == nil {
+		log = slog.Default()
+	}
+	r := &certdClientReloader{certPath: certPath, keyPath: keyPath, caPath: caPath, log: log}
 	if err := r.refreshCert(); err != nil {
 		return nil, err
 	}
@@ -691,7 +699,22 @@ func newCertdClientReloader(certPath, keyPath, caPath string) (*certdClientReloa
 	return r, nil
 }
 
+// refreshCert re-reads cert+key when mtime advances. No-op when
+// unchanged. Logs at info on every actual swap so operators see
+// external workload-cert rotations (cert-agentd, manual replace)
+// propagate into this process.
 func (r *certdClientReloader) refreshCert() error {
+	stat, err := os.Stat(r.certPath)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", r.certPath, err)
+	}
+	r.mu.RLock()
+	prev := r.certMtime
+	loaded := r.cert != nil
+	r.mu.RUnlock()
+	if !stat.ModTime().After(prev) && loaded {
+		return nil
+	}
 	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
 		return fmt.Errorf("load certd-client cert pair: %w", err)
@@ -708,12 +731,17 @@ func (r *certdClientReloader) refreshCert() error {
 	r.mu.Lock()
 	r.cert = &keyPair
 	r.notAfter = notAfter
+	r.certMtime = stat.ModTime()
 	r.mu.Unlock()
+	r.log.Info("certd-client cert reloaded",
+		"path", r.certPath,
+		"mtime", stat.ModTime(),
+		"not_after", notAfter)
 	return nil
 }
 
 func (r *certdClientReloader) refreshCABundle() error {
-	pool, mtime, err := readPoolIfChanged(r.caPath, r.caMtime, func() bool {
+	pool, raw, mtime, err := readPoolIfChanged(r.caPath, r.caMtime, func() bool {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		return r.pool != nil
@@ -725,18 +753,18 @@ func (r *certdClientReloader) refreshCABundle() error {
 	r.pool = pool
 	r.caMtime = mtime
 	r.mu.Unlock()
+	r.log.Info("certd-client CA bundle reloaded",
+		"path", r.caPath,
+		"mtime", mtime,
+		"fingerprint", bundleFingerprint(raw))
 	return nil
 }
 
-// RunCAPoll ticks every interval and reloads the CA bundle on mtime
-// advance. No-op (returns nil immediately) when caPath is empty,
-// since the system pool can't be hot-reloaded from this surface.
-// Returns when ctx is cancelled.
-func (r *certdClientReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
-	if r.caPath == "" {
-		<-ctx.Done()
-		return ctx.Err()
-	}
+// RunPoll ticks every interval and reloads BOTH the workload cert
+// and the CA bundle when their mtimes advance. No-op for the
+// CA-bundle side when caPath is empty (system pool — can't be
+// hot-reloaded from here). Returns when ctx is cancelled.
+func (r *certdClientReloader) RunPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
 	if interval <= 0 {
 		interval = DefaultCAPollInterval
 	}
@@ -747,8 +775,13 @@ func (r *certdClientReloader) RunCAPoll(ctx context.Context, interval time.Durat
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := r.refreshCABundle(); err != nil {
-				log.Warn("certd-client CA reload failed; keeping previous pool", "path", r.caPath, "err", err)
+			if err := r.refreshCert(); err != nil {
+				log.Warn("certd-client cert reload failed; keeping previous cert", "path", r.certPath, "err", err)
+			}
+			if r.caPath != "" {
+				if err := r.refreshCABundle(); err != nil {
+					log.Warn("certd-client CA reload failed; keeping previous pool", "path", r.caPath, "err", err)
+				}
 			}
 		}
 	}
@@ -815,15 +848,20 @@ func (r *certdClientReloader) LeafExpiry() time.Time {
 // disabling the standard chain verifier.
 type tunnelServerReloader struct {
 	certPath, keyPath, clientCAPath string
+	log                             *slog.Logger
 
 	mu            sync.RWMutex
 	cert          *tls.Certificate
+	certMtime     time.Time
 	clientCAPool  *x509.CertPool
 	clientCAMtime time.Time
 }
 
-func newTunnelServerReloader(certPath, keyPath, clientCAPath string) (*tunnelServerReloader, error) {
-	r := &tunnelServerReloader{certPath: certPath, keyPath: keyPath, clientCAPath: clientCAPath}
+func newTunnelServerReloader(certPath, keyPath, clientCAPath string, log *slog.Logger) (*tunnelServerReloader, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	r := &tunnelServerReloader{certPath: certPath, keyPath: keyPath, clientCAPath: clientCAPath, log: log}
 	if err := r.refreshCert(); err != nil {
 		return nil, err
 	}
@@ -834,6 +872,17 @@ func newTunnelServerReloader(certPath, keyPath, clientCAPath string) (*tunnelSer
 }
 
 func (r *tunnelServerReloader) refreshCert() error {
+	stat, err := os.Stat(r.certPath)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", r.certPath, err)
+	}
+	r.mu.RLock()
+	prev := r.certMtime
+	loaded := r.cert != nil
+	r.mu.RUnlock()
+	if !stat.ModTime().After(prev) && loaded {
+		return nil
+	}
 	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
 		return fmt.Errorf("load tunnel server cert: %w", err)
@@ -847,12 +896,16 @@ func (r *tunnelServerReloader) refreshCert() error {
 	}
 	r.mu.Lock()
 	r.cert = &keyPair
+	r.certMtime = stat.ModTime()
 	r.mu.Unlock()
+	r.log.Info("tunnel server cert reloaded",
+		"path", r.certPath,
+		"mtime", stat.ModTime())
 	return nil
 }
 
 func (r *tunnelServerReloader) refreshClientCAs() error {
-	pool, mtime, err := readPoolIfChanged(r.clientCAPath, r.clientCAMtime, func() bool {
+	pool, raw, mtime, err := readPoolIfChanged(r.clientCAPath, r.clientCAMtime, func() bool {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		return r.clientCAPool != nil
@@ -864,10 +917,17 @@ func (r *tunnelServerReloader) refreshClientCAs() error {
 	r.clientCAPool = pool
 	r.clientCAMtime = mtime
 	r.mu.Unlock()
+	r.log.Info("tunnel client CA bundle reloaded",
+		"path", r.clientCAPath,
+		"mtime", mtime,
+		"fingerprint", bundleFingerprint(raw))
 	return nil
 }
 
-func (r *tunnelServerReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
+// RunPoll ticks every interval and reloads BOTH the server cert
+// and the ClientCAs bundle when their mtimes advance. Returns
+// when ctx is cancelled.
+func (r *tunnelServerReloader) RunPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
 	if interval <= 0 {
 		interval = DefaultCAPollInterval
 	}
@@ -878,6 +938,9 @@ func (r *tunnelServerReloader) RunCAPoll(ctx context.Context, interval time.Dura
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			if err := r.refreshCert(); err != nil {
+				log.Warn("tunnel server cert reload failed; keeping previous cert", "path", r.certPath, "err", err)
+			}
 			if err := r.refreshClientCAs(); err != nil {
 				log.Warn("tunnel client CA reload failed; keeping previous pool", "path", r.clientCAPath, "err", err)
 			}
@@ -913,28 +976,40 @@ func (r *tunnelServerReloader) serverConfigForClient(_ *tls.ClientHelloInfo) (*t
 	}, nil
 }
 
-// readPoolIfChanged returns (newPool, newMtime, nil) when the file's
-// mtime has advanced past prevMtime OR alreadyLoaded() returns false
-// (the initial-load case). Returns (nil, _, nil) when the file is
-// unchanged — caller treats this as a no-op. Shared by both
-// reloaders so the mtime + parse logic stays in one place.
-func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, time.Time, error) {
+// readPoolIfChanged returns (newPool, raw, newMtime, nil) when the
+// file's mtime has advanced past prevMtime OR alreadyLoaded()
+// returns false (the initial-load case). Returns
+// (nil, nil, _, nil) when the file is unchanged — caller treats
+// this as a no-op. raw is the PEM bytes the pool was built from,
+// suitable for fingerprinting in the caller's success log.
+// Shared by both reloaders so the mtime + parse logic stays in
+// one place.
+func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, []byte, time.Time, error) {
 	stat, err := os.Stat(path)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
 	}
 	if !stat.ModTime().After(prevMtime) && alreadyLoaded() {
-		return nil, time.Time{}, nil
+		return nil, nil, time.Time{}, nil
 	}
 	pem, err := os.ReadFile(path)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
+		return nil, nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
+		return nil, nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
 	}
-	return pool, stat.ModTime(), nil
+	return pool, pem, stat.ModTime(), nil
+}
+
+// bundleFingerprint is the first 8 bytes of sha256(pem), hex-
+// encoded. Short enough for human-friendly log diffing across a
+// fleet, long enough that distinct bundles don't collide in
+// practice.
+func bundleFingerprint(pem []byte) string {
+	sum := sha256.Sum256(pem)
+	return hex.EncodeToString(sum[:8])
 }
 
 // loadSSHPrivateKey reads any supported private key file and returns

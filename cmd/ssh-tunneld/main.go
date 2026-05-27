@@ -65,8 +65,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,7 +134,7 @@ func runAgent(ctx context.Context) error {
 		return errors.New("SSH_TUNNELD_CERTD_CA or SSH_TUNNELD_TLS_CA is required for certd verification")
 	}
 
-	reloader, err := newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, resolveProxyServerName(proxyAddr))
+	reloader, err := newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, resolveProxyServerName(proxyAddr), log)
 	if err != nil {
 		return fmt.Errorf("tls reloader: %w", err)
 	}
@@ -197,7 +199,7 @@ func runAgent(ctx context.Context) error {
 		errCh <- dialer.Run(rootCtx)
 	})
 	wg.Go(func() {
-		errCh <- reloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log)
+		errCh <- reloader.RunPoll(rootCtx, DefaultCAPollInterval, log)
 	})
 
 	if renewer != nil {
@@ -342,10 +344,12 @@ type tlsReloader struct {
 	certPath, keyPath        string
 	proxyCAPath, certdCAPath string
 	proxyServerName          string
+	log                      *slog.Logger
 
 	mu           sync.RWMutex
 	cert         *tls.Certificate
 	notAfter     time.Time
+	certMtime    time.Time
 	proxyPool    *x509.CertPool
 	certdPool    *x509.CertPool
 	proxyCAMtime time.Time
@@ -360,13 +364,17 @@ const DefaultCAPollInterval = 30 * time.Second
 // returns a populated reloader. proxyServerName is the SNI the
 // dialer sets at handshake (derived from SSH_TUNNELD_PROXY_ADDR
 // when SSH_TUNNELD_PROXY_SERVER_NAME is unset).
-func newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, proxyServerName string) (*tlsReloader, error) {
+func newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, proxyServerName string, log *slog.Logger) (*tlsReloader, error) {
+	if log == nil {
+		log = slog.Default()
+	}
 	r := &tlsReloader{
 		certPath:        certPath,
 		keyPath:         keyPath,
 		proxyCAPath:     proxyCAPath,
 		certdCAPath:     certdCAPath,
 		proxyServerName: proxyServerName,
+		log:             log,
 	}
 	if err := r.refreshCert(); err != nil {
 		return nil, err
@@ -380,11 +388,23 @@ func newTLSReloader(certPath, keyPath, proxyCAPath, certdCAPath, proxyServerName
 	return r, nil
 }
 
-// refreshCert re-reads the workload cert+key from disk. Always
-// re-reads (no mtime gate) because callers fire this on demand
-// (e.g., a future SIGHUP hook) where they already know the file
-// changed.
+// refreshCert re-reads the workload cert+key from disk when the
+// cert file's mtime has advanced. No-op when unchanged so the
+// poll path is cheap. Logs at info on every actual swap so
+// operators see external rotations (cert-agentd, manual replace)
+// propagate.
 func (r *tlsReloader) refreshCert() error {
+	stat, err := os.Stat(r.certPath)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", r.certPath, err)
+	}
+	r.mu.RLock()
+	prev := r.certMtime
+	loaded := r.cert != nil
+	r.mu.RUnlock()
+	if !stat.ModTime().After(prev) && loaded {
+		return nil
+	}
 	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
 		return fmt.Errorf("load workload cert pair: %w", err)
@@ -401,16 +421,22 @@ func (r *tlsReloader) refreshCert() error {
 	r.mu.Lock()
 	r.cert = &keyPair
 	r.notAfter = notAfter
+	r.certMtime = stat.ModTime()
 	r.mu.Unlock()
+	r.log.Info("workload cert reloaded",
+		"path", r.certPath,
+		"mtime", stat.ModTime(),
+		"not_after", notAfter)
 	return nil
 }
 
 // refreshProxyCA / refreshCertdCA re-read the corresponding CA
 // bundle when mtime advances. No-op when unchanged, atomic pool
 // swap when changed. Read failures return the error; the previous
-// pool stays live for VerifyConnection callers.
+// pool stays live for VerifyConnection callers. Logs at info on
+// every actual swap so operators see rotation propagation.
 func (r *tlsReloader) refreshProxyCA() error {
-	pool, mtime, err := readPoolIfChanged(r.proxyCAPath, r.proxyCAMtime, func() bool {
+	pool, raw, mtime, err := readPoolIfChanged(r.proxyCAPath, r.proxyCAMtime, func() bool {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		return r.proxyPool != nil
@@ -422,11 +448,15 @@ func (r *tlsReloader) refreshProxyCA() error {
 	r.proxyPool = pool
 	r.proxyCAMtime = mtime
 	r.mu.Unlock()
+	r.log.Info("proxy CA bundle reloaded",
+		"path", r.proxyCAPath,
+		"mtime", mtime,
+		"fingerprint", bundleFingerprint(raw))
 	return nil
 }
 
 func (r *tlsReloader) refreshCertdCA() error {
-	pool, mtime, err := readPoolIfChanged(r.certdCAPath, r.certdCAMtime, func() bool {
+	pool, raw, mtime, err := readPoolIfChanged(r.certdCAPath, r.certdCAMtime, func() bool {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		return r.certdPool != nil
@@ -438,37 +468,56 @@ func (r *tlsReloader) refreshCertdCA() error {
 	r.certdPool = pool
 	r.certdCAMtime = mtime
 	r.mu.Unlock()
+	r.log.Info("certd CA bundle reloaded",
+		"path", r.certdCAPath,
+		"mtime", mtime,
+		"fingerprint", bundleFingerprint(raw))
 	return nil
 }
 
-// readPoolIfChanged returns (newPool, newMtime, nil) when the file's
-// mtime has advanced past prevMtime OR alreadyLoaded() returns false
-// (the initial-load case). Returns (nil, _, nil) when the file is
-// unchanged — caller treats this as a no-op.
-func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, time.Time, error) {
+// readPoolIfChanged returns (newPool, raw, newMtime, nil) when the
+// file's mtime has advanced past prevMtime OR alreadyLoaded()
+// returns false (the initial-load case). Returns
+// (nil, nil, _, nil) when the file is unchanged — caller treats
+// this as a no-op. raw is the PEM bytes the pool was built from,
+// suitable for fingerprinting in the caller's success log.
+func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, []byte, time.Time, error) {
 	stat, err := os.Stat(path)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
 	}
 	if !stat.ModTime().After(prevMtime) && alreadyLoaded() {
-		return nil, time.Time{}, nil
+		return nil, nil, time.Time{}, nil
 	}
 	pem, err := os.ReadFile(path)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
+		return nil, nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
+		return nil, nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
 	}
-	return pool, stat.ModTime(), nil
+	return pool, pem, stat.ModTime(), nil
 }
 
-// RunCAPoll ticks every interval and re-reads both bundles when
-// their mtimes advance. Read failures keep the previous pool live
-// and log warn so a corrupt drop-in never opens a trust window.
-// Returns when ctx is cancelled.
-func (r *tlsReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
+// bundleFingerprint is the first 8 bytes of sha256(pem), hex-
+// encoded. Short enough for human-friendly log diffing across a
+// fleet, long enough that distinct bundles don't collide in
+// practice.
+func bundleFingerprint(pem []byte) string {
+	sum := sha256.Sum256(pem)
+	return hex.EncodeToString(sum[:8])
+}
+
+// RunPoll ticks every interval and re-reads the workload cert AND
+// both CA bundles when their mtimes advance. Cert + bundle polls
+// share the same loop because an external rotator (cert-agentd,
+// manual replace) and a CA-bundle rotation often happen in the
+// same operator window; one cadence keeps the runbook simple.
+// Read failures keep the previous in-memory state live and log
+// warn so a corrupt drop-in never opens a trust window. Returns
+// when ctx is cancelled.
+func (r *tlsReloader) RunPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
 	if interval <= 0 {
 		interval = DefaultCAPollInterval
 	}
@@ -479,6 +528,9 @@ func (r *tlsReloader) RunCAPoll(ctx context.Context, interval time.Duration, log
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			if err := r.refreshCert(); err != nil {
+				log.Warn("workload cert reload failed; keeping previous cert", "path", r.certPath, "err", err)
+			}
 			if err := r.refreshProxyCA(); err != nil {
 				log.Warn("proxy CA reload failed; keeping previous pool", "path", r.proxyCAPath, "err", err)
 			}

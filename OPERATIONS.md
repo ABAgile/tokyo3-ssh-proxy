@@ -163,12 +163,28 @@ expiry, ssh-proxyd emits a one-shot warn:
 ### CA-bundle rotation (zero-restart)
 
 ssh-proxyd has two independent TLS surfaces, each with its own
-bundle that's mtime-polled every 30s by a dedicated goroutine.
-Operators can drop in a new bundle on either path without
-restarting the proxy; read failures keep the previous pool live
-and log warn (`certd-client CA reload failed; …` or
-`tunnel client CA reload failed; …`) so a corrupt drop-in never
-opens a trust window.
+bundle that's mtime-polled every 30s by a dedicated goroutine —
+**alongside** the workload cert and tunnel-server cert paths,
+so external rotations of any TLS material land in-process on the
+next poll without a restart. Operators can drop in a new bundle
+on either path; read failures keep the previous pool live and
+log warn (`certd-client CA reload failed; …`, `tunnel client CA
+reload failed; …`, `certd-client cert reload failed; …`, etc.)
+so a corrupt drop-in never opens a trust window.
+
+Every actual swap logs at info — operators rely on these lines
+during a coordinated CA rotation to confirm a uniform post-
+rotation state across the fleet before flipping certd's signing
+key:
+
+  - `certd-client cert reloaded path=… mtime=… not_after=…`
+  - `certd-client CA bundle reloaded path=… mtime=… fingerprint=…`
+  - `tunnel server cert reloaded path=… mtime=…`
+  - `tunnel client CA bundle reloaded path=… mtime=… fingerprint=…`
+
+The fingerprint is `sha256(pem)[:8]` hex — short enough to grep
+across a fleet's logs (or NATS-shipped log subjects), long enough
+that distinct bundles don't collide in practice.
 
 | Bundle env var                                  | Used for                                              | Pattern                                            |
 |-------------------------------------------------|-------------------------------------------------------|----------------------------------------------------|
@@ -258,13 +274,25 @@ the agent emits a one-shot warn:
 ### CA-bundle rotation (zero-restart)
 
 `SSH_TUNNELD_TLS_CA` (proxy face) and `SSH_TUNNELD_CERTD_CA` (certd
-face) are independently mtime-polled every 30s. Operators can drop
-in a new bundle on either path (typically `[OLD, NEW]` during a
-rotation overlap window) and the agent picks it up on the next
-tick — no restart required. Read failures keep the previous pool
-live and log warn (`proxy CA reload failed; keeping previous pool`
-or `certd CA reload failed; …`) so a corrupt drop-in never opens
-a trust window.
+face) are independently mtime-polled every 30s, **alongside** the
+workload-cert path (`SSH_TUNNELD_TLS_CERT/_KEY`) — so an external
+rotator (cert-agentd, manual replace) lands in-process on the
+next poll without a restart. Read failures keep the previous
+state live and log warn (`proxy CA reload failed; keeping previous pool`,
+`workload cert reload failed; keeping previous cert`, etc.) so a
+corrupt drop-in never opens a trust window.
+
+Every actual swap logs at info — operators rely on these lines
+during a coordinated CA rotation to confirm a uniform post-rotation
+state across the fleet before flipping certd's signing key:
+
+  - `workload cert reloaded path=… mtime=… not_after=…`
+  - `proxy CA bundle reloaded path=… mtime=… fingerprint=…`
+  - `certd CA bundle reloaded path=… mtime=… fingerprint=…`
+
+The fingerprint is `sha256(pem)[:8]` hex — short enough to grep
+across a fleet's logs (or NATS-shipped log subjects), long enough
+that distinct bundles don't collide in practice.
 
 The TLS material the agent presents on both faces uses
 `InsecureSkipVerify + VerifyConnection` rather than the standard
