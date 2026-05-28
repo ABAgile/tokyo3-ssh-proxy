@@ -15,27 +15,25 @@
 package certclient
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/abagile/tokyo3-base/api"
 )
 
 // DefaultTimeout caps each HTTP call. certd is on the same private
 // network as the proxy; 5s is generous.
 const DefaultTimeout = 5 * time.Second
 
-// Client is a thin wrapper around [http.Client] tailored to certd's
-// signing endpoints. Safe for concurrent use.
+// Client is a thin wrapper around base/api's Resty client tailored
+// to certd's signing endpoints. Safe for concurrent use.
 type Client struct {
-	baseURL string
-	http    *http.Client
+	api *api.RestyClient
 }
 
 // NewClient builds a client for certd at baseURL ("https://certd.example.com").
@@ -47,16 +45,11 @@ func NewClient(baseURL string, tlsCfg *tls.Config) (*Client, error) {
 		return nil, errors.New("baseURL is required")
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
-	transport := &http.Transport{
-		TLSClientConfig: tlsCfg,
+	opts := []api.RestyClientOption{api.CO.WithTimeout(DefaultTimeout)}
+	if tlsCfg != nil {
+		opts = append(opts, api.CO.WithTransport(&http.Transport{TLSClientConfig: tlsCfg}))
 	}
-	return &Client{
-		baseURL: baseURL,
-		http: &http.Client{
-			Transport: transport,
-			Timeout:   DefaultTimeout,
-		},
-	}, nil
+	return &Client{api: api.NewRestClient(baseURL, opts...)}, nil
 }
 
 // SignUserRequest mirrors certd's POST /api/v1/ssh/sign-user body.
@@ -87,39 +80,14 @@ type SignUserResponse struct {
 // validity envelope. ctx caps the call; the HTTP client also enforces
 // [DefaultTimeout].
 //
-// Non-2xx responses are returned as errors with the response body
-// surfaced so debugging upstream config issues doesn't require
-// breaking out tcpdump.
+// Non-2xx responses surface as wrapped *[api.ApiError] values whose
+// Error() string includes the response body so upstream policy
+// denial messages land in operator logs without further plumbing.
 func (c *Client) SignUserCert(ctx context.Context, req SignUserRequest) (*SignUserResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal sign-user request: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/v1/ssh/sign-user", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("sign-user http call: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read sign-user response: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("sign-user returned %d: %s",
-			resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
 	var out SignUserResponse
-	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("decode sign-user response: %w", err)
+	if err := c.api.R(ctx, http.MethodPost, "/api/v1/ssh/sign-user", &out,
+		api.RO.WithBody(req)); err != nil {
+		return nil, fmt.Errorf("sign-user: %w", err)
 	}
 	return &out, nil
 }
@@ -157,35 +125,10 @@ type SignHostResponse struct {
 // validity envelope. Behaves identically to [Client.SignUserCert]
 // regarding context, timeouts, and error surfacing.
 func (c *Client) SignHostCert(ctx context.Context, req SignHostRequest) (*SignHostResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal sign-host request: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/v1/ssh/sign-host", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("sign-host http call: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read sign-host response: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("sign-host returned %d: %s",
-			resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
 	var out SignHostResponse
-	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("decode sign-host response: %w", err)
+	if err := c.api.R(ctx, http.MethodPost, "/api/v1/ssh/sign-host", &out,
+		api.RO.WithBody(req)); err != nil {
+		return nil, fmt.Errorf("sign-host: %w", err)
 	}
 	return &out, nil
 }
