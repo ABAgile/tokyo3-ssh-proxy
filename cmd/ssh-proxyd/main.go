@@ -140,9 +140,7 @@ import (
 
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/envutil"
-	"github.com/abagile/tokyo3-base/journal"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
-	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/google/uuid"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -1031,34 +1029,15 @@ func loadSSHPrivateKey(path string) (gossh.Signer, error) {
 // empty, returns [audit.NoopSink] — keeps the dev / no-NATS path
 // working without a broker.
 func openAuditSink(log *slog.Logger) (audit.Sink, error) {
-	url := os.Getenv("SSH_PROXYD_NATS_URL")
-	if url == "" {
-		log.Warn("SSH_PROXYD_NATS_URL not set — audit sink is no-op; not for production")
-		return audit.NoopSink, nil
-	}
-	tlsCfg, err := btls.FromFiles(
-		os.Getenv("SSH_PROXYD_NATS_CERT"),
-		os.Getenv("SSH_PROXYD_NATS_KEY"),
-		envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("nats audit TLS: %w", err)
-	}
-	if tlsCfg != nil {
-		log.Info("audit sink: NATS JetStream with mTLS", "url", url)
-	} else {
-		log.Warn("audit sink: SSH_PROXYD_NATS_CERT not set — connecting without mTLS (not for production)")
-	}
-	jSink, err := jetstream.NewSink(jetstream.SinkConfig{
-		URL:     url,
-		Subject: audit.Subject,
-		TLS:     tlsCfg,
-		Log:     log,
+	return jetstream.NewAuditSink[audit.Entry](jetstream.AuditSinkConfig{
+		URL:       os.Getenv("SSH_PROXYD_NATS_URL"),
+		CertFile:  os.Getenv("SSH_PROXYD_NATS_CERT"),
+		KeyFile:   os.Getenv("SSH_PROXYD_NATS_KEY"),
+		CAFile:    envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
+		Subject:   audit.Subject,
+		EnvPrefix: "SSH_PROXYD_NATS",
+		Log:       log,
 	})
-	if err != nil {
-		return nil, err
-	}
-	return journal.NewJSONSink[audit.Entry](jSink), nil
 }
 
 // loadRecordingSink returns the asciinema cast sink. When

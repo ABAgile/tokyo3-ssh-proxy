@@ -161,27 +161,13 @@ func runAgent(ctx context.Context) error {
 	// Surface workload-cert remaining validity. The reloader's
 	// GetClientCertificate hot-swaps the in-memory cert when an
 	// external rotator (cert-agentd, manual replace) updates the
-	// file — but only on the next refreshCert call. For now there's
-	// no refreshCert trigger besides startup, so a long outage that
-	// crosses leaf expiry still requires intervention. The 24h warn
-	// surfaces that risk.
-	if !r.LeafExpiry().IsZero() {
-		if remaining := time.Until(r.LeafExpiry()); remaining < 24*time.Hour {
-			log.Warn("workload mTLS cert near expiry — restart ssh-tunneld after the next rotation",
-				"remaining", remaining.Round(time.Second),
-				"not_after", r.LeafExpiry())
-		}
-	}
+	// file. The 24h warn fires once at startup when the cert is
+	// already close to expiry.
+	r.WarnIfNearExpiry(24*time.Hour, "workload mTLS cert near expiry — restart ssh-tunneld after the next rotation")
 
 	// Shared closure used by both retry surfaces (dialer + host-cert
 	// renewer) so operators see the same field on every failure log.
-	workloadRemainingAttrs := func() []any {
-		exp := r.LeafExpiry()
-		if exp.IsZero() {
-			return nil
-		}
-		return []any{"workload_cert_remaining", time.Until(exp).Round(time.Second)}
-	}
+	workloadRemainingAttrs := r.ExpiryAttrs("workload_cert_remaining")
 
 	localAddr := envutil.Or("SSH_TUNNELD_LOCAL_SSHD", forward.DefaultLocalAddr)
 	fwd := forward.New(forward.Config{
