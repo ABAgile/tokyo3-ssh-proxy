@@ -139,6 +139,7 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
 	btls "github.com/abagile/tokyo3-base/tls"
@@ -191,11 +192,11 @@ func runServe(ctx context.Context) error {
 		URL:      os.Getenv("SSH_PROXYD_NATS_URL"),
 		CertFile: os.Getenv("SSH_PROXYD_NATS_CERT"),
 		KeyFile:  os.Getenv("SSH_PROXYD_NATS_KEY"),
-		CAFile:   envFirst("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
+		CAFile:   envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
 	}, applog.WithStdout())
 	defer drainLog()
 
-	addr := envOr("SSH_PROXYD_ADDR", ":2222")
+	addr := envutil.Or("SSH_PROXYD_ADDR", ":2222")
 
 	hostSigner, err := loadHostKey(log)
 	if err != nil {
@@ -221,7 +222,7 @@ func runServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
 	}
-	defer closeIfCloser(auditSink)
+	defer envutil.CloseIfCloser(auditSink)
 
 	// Build the certd-client TLS reloader once when any certd-
 	// touching surface is enabled (per-session minter OR revocation
@@ -434,7 +435,7 @@ func newTunnelServerReloaderFromEnv(log *slog.Logger) (*tunnelServerReloader, er
 	}
 	certFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_CERT")
 	keyFile := os.Getenv("SSH_PROXYD_TUNNEL_TLS_KEY")
-	caFile := envFirst("SSH_PROXYD_TUNNEL_CLIENT_CA", "SSH_PROXYD_WORKLOAD_CA")
+	caFile := envutil.First("SSH_PROXYD_TUNNEL_CLIENT_CA", "SSH_PROXYD_WORKLOAD_CA")
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
@@ -479,13 +480,6 @@ func versionCmd() *cobra.Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
 
 // loadHostKey returns the SSH host signer. When SSH_PROXYD_HOST_KEY
 // is set, the file is parsed via [gossh.ParsePrivateKey] which
@@ -1032,17 +1026,6 @@ func loadSSHPrivateKey(path string) (gossh.Signer, error) {
 	return signer, nil
 }
 
-// envFirst returns the first non-empty env var among keys. Used for
-// fallback chains (e.g. SSH_PROXYD_NATS_CA → SSH_PROXYD_WORKLOAD_CA).
-func envFirst(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // openAuditSink builds the JetStream publisher Sink from
 // SSH_PROXYD_NATS_URL + the CERT/KEY/CA env vars. When the URL is
 // empty, returns [audit.NoopSink] — keeps the dev / no-NATS path
@@ -1056,7 +1039,7 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 	tlsCfg, err := btls.FromFiles(
 		os.Getenv("SSH_PROXYD_NATS_CERT"),
 		os.Getenv("SSH_PROXYD_NATS_KEY"),
-		envFirst("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
+		envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit TLS: %w", err)
@@ -1076,14 +1059,6 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 		return nil, err
 	}
 	return journal.NewJSONSink[audit.Entry](jSink), nil
-}
-
-// closeIfCloser invokes Close on resources that implement io.Closer,
-// silently ignoring values that don't (e.g., audit.NoopSink).
-func closeIfCloser(v any) {
-	if c, ok := v.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
 }
 
 // loadRecordingSink returns the asciinema cast sink. When

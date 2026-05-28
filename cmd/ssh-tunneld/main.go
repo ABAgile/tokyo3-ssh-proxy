@@ -87,6 +87,7 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
@@ -128,20 +129,20 @@ func runCmd() *cobra.Command {
 func runAgent(ctx context.Context) error {
 	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{
 		App:      appName,
-		Instance: envOr("SSH_TUNNELD_INSTANCE", hostnameOrEmpty()),
+		Instance: envutil.Or("SSH_TUNNELD_INSTANCE", envutil.HostnameOrEmpty()),
 	}, applog.NATSConfig{
 		URL:      os.Getenv("SSH_TUNNELD_NATS_URL"),
-		CertFile: envFirst("SSH_TUNNELD_NATS_CERT", "SSH_TUNNELD_TLS_CERT"),
-		KeyFile:  envFirst("SSH_TUNNELD_NATS_KEY", "SSH_TUNNELD_TLS_KEY"),
-		CAFile:   envFirst("SSH_TUNNELD_NATS_CA", "SSH_TUNNELD_TLS_CA"),
+		CertFile: envutil.First("SSH_TUNNELD_NATS_CERT", "SSH_TUNNELD_TLS_CERT"),
+		KeyFile:  envutil.First("SSH_TUNNELD_NATS_KEY", "SSH_TUNNELD_TLS_KEY"),
+		CAFile:   envutil.First("SSH_TUNNELD_NATS_CA", "SSH_TUNNELD_TLS_CA"),
 	}, applog.WithStdout())
 	defer drainLog()
 
-	proxyAddr := mustEnv("SSH_TUNNELD_PROXY_ADDR")
-	certPath := mustEnv("SSH_TUNNELD_TLS_CERT")
-	keyPath := mustEnv("SSH_TUNNELD_TLS_KEY")
-	proxyCAPath := mustEnv("SSH_TUNNELD_TLS_CA")
-	certdCAPath := envFirst("SSH_TUNNELD_CERTD_CA", "SSH_TUNNELD_TLS_CA")
+	proxyAddr := envutil.MustEnv("SSH_TUNNELD_PROXY_ADDR")
+	certPath := envutil.MustEnv("SSH_TUNNELD_TLS_CERT")
+	keyPath := envutil.MustEnv("SSH_TUNNELD_TLS_KEY")
+	proxyCAPath := envutil.MustEnv("SSH_TUNNELD_TLS_CA")
+	certdCAPath := envutil.First("SSH_TUNNELD_CERTD_CA", "SSH_TUNNELD_TLS_CA")
 	if certdCAPath == "" {
 		return errors.New("SSH_TUNNELD_CERTD_CA or SSH_TUNNELD_TLS_CA is required for certd verification")
 	}
@@ -176,7 +177,7 @@ func runAgent(ctx context.Context) error {
 		return []any{"workload_cert_remaining", time.Until(exp).Round(time.Second)}
 	}
 
-	localAddr := envOr("SSH_TUNNELD_LOCAL_SSHD", forward.DefaultLocalAddr)
+	localAddr := envutil.Or("SSH_TUNNELD_LOCAL_SSHD", forward.DefaultLocalAddr)
 	fwd := forward.New(forward.Config{
 		LocalAddr: localAddr,
 		Log:       log,
@@ -250,44 +251,6 @@ func versionCmd() *cobra.Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		fmt.Fprintf(os.Stderr, "%s: %s is required\n", appName, key)
-		os.Exit(2)
-	}
-	return v
-}
-
-func envFirst(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// hostnameOrEmpty returns os.Hostname() on success and "" on error.
-// Used as the default for SSH_TUNNELD_INSTANCE so the NATS subject
-// hierarchy picks up a sensible per-host suffix without any
-// operator action; the empty fallback keeps the helper at its
-// legacy singleton-subject shape when the OS refuses to answer.
-func hostnameOrEmpty() string {
-	h, err := os.Hostname()
-	if err != nil {
-		return ""
-	}
-	return h
-}
 
 // tlsReloader owns the in-process TLS state ssh-tunneld presents to
 // its two peers: the proxy's tunnel listener (proxyTLSConfig) and
@@ -617,7 +580,7 @@ func buildHostCertRenewer(log *slog.Logger, reloader *tlsReloader, signErrorAttr
 	if err != nil {
 		hostname = "localhost"
 	}
-	keyID := envOr("SSH_TUNNELD_HOST_KEY_ID", "host:"+hostname)
+	keyID := envutil.Or("SSH_TUNNELD_HOST_KEY_ID", "host:"+hostname)
 	principals := []string{hostname}
 	if raw := os.Getenv("SSH_TUNNELD_HOST_PRINCIPALS"); raw != "" {
 		principals = principals[:0]
@@ -627,7 +590,7 @@ func buildHostCertRenewer(log *slog.Logger, reloader *tlsReloader, signErrorAttr
 			}
 		}
 	}
-	certOut := envOr("SSH_TUNNELD_HOST_CERT", hostKeyPath+"-cert.pub")
+	certOut := envutil.Or("SSH_TUNNELD_HOST_CERT", hostKeyPath+"-cert.pub")
 
 	r, err := hostcert.New(hostcert.Config{
 		Signer:         client,
