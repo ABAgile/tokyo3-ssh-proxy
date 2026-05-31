@@ -17,6 +17,13 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH=arm64
 
+# VERSION is injected into each binary's `var Version` via -ldflags.
+# Defaults to "dev"; the in-binary resolveVersion() helper falls back
+# to runtime/debug.BuildInfo (vcs.revision + vcs.modified) when this
+# stays at "dev". Compose passes dev-docker by default to keep
+# image-built binaries distinguishable from `go install`-built ones.
+ARG VERSION=dev
+
 WORKDIR /src
 
 # Download deps first (cached layer unless go.mod/go.sum change).
@@ -27,9 +34,9 @@ COPY cmd/ cmd/
 COPY internal/ internal/
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/ssh-proxyd ./cmd/ssh-proxyd
+    go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/ssh-proxyd ./cmd/ssh-proxyd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/ssh-tunneld ./cmd/ssh-tunneld
+    go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/ssh-tunneld ./cmd/ssh-tunneld
 
 # ── Stage 2: Tunnel agent image (build with --target tunneld) ─────────────────
 FROM alpine:3.21 AS tunneld

@@ -1,0 +1,80 @@
+name: Docker
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Proxy image — ghcr.io/<repo> (ssh-proxyd) ───────────────────────
+      - id: meta-proxy
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: proxy
+          build-args: |
+            VERSION=${{ steps.meta-proxy.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-proxy.outputs.tags }}
+          labels: ${{ steps.meta-proxy.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Tunnel agent image — ghcr.io/<repo>-agent (ssh-tunneld) ─────────
+      # Shares the builder layer via the gha cache populated above, so
+      # this build is just the small alpine + COPY tail.
+      - id: meta-tunneld
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}-agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: tunneld
+          build-args: |
+            VERSION=${{ steps.meta-tunneld.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-tunneld.outputs.tags }}
+          labels: ${{ steps.meta-tunneld.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
