@@ -34,22 +34,28 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ── Stage 2: Tunnel agent image (build with --target tunneld) ─────────────────
 FROM alpine:3.21 AS tunneld
 
-RUN apk add --no-cache ca-certificates
+# tini as PID 1 reaps orphaned children (e.g. ssl_client from busybox-wget
+# healthchecks) and forwards signals for clean shutdown — a bare Go PID 1
+# doesn't reap, so cgroup pids.current would climb forever.
+RUN apk add --no-cache ca-certificates tini
 
 COPY --from=builder /out/ssh-tunneld /usr/local/bin/ssh-tunneld
 
-ENTRYPOINT ["/usr/local/bin/ssh-tunneld"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/ssh-tunneld"]
 CMD ["run"]
 
 # ── Stage 3: Proxy runtime image (default target) ─────────────────────────────
 FROM alpine:3.21 AS proxy
 
-RUN apk add --no-cache ca-certificates
+# tini as PID 1 reaps orphaned children (e.g. ssl_client from busybox-wget
+# healthchecks) and forwards signals for clean shutdown — a bare Go PID 1
+# doesn't reap, so cgroup pids.current would climb forever.
+RUN apk add --no-cache ca-certificates tini
 
 COPY --from=builder /out/ssh-proxyd /usr/local/bin/ssh-proxyd
 
 # SSH gateway port — exposed for user clients to connect to.
 EXPOSE 2222
 
-ENTRYPOINT ["/usr/local/bin/ssh-proxyd"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/ssh-proxyd"]
 CMD ["serve"]
