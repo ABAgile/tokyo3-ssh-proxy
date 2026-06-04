@@ -43,6 +43,10 @@
 // Optional env vars:
 //
 //	SSH_PROXYD_ADDR      TCP listen address (default ":2222").
+//	SSH_PROXYD_DEBUG_ADDR  Optional plaintext address for the diagnostics server (net/http/pprof
+//	                     + a periodic goroutine/OS-thread stats log), e.g. "127.0.0.1:6060".
+//	                     Unset ⇒ disabled. Never expose publicly — it serves unauthenticated
+//	                     profiling on its own listener, off the SSH/tunnel surface.
 //	SSH_PROXYD_HOST_KEY  Path to a PKCS#8 Ed25519 private key PEM used
 //	                     as the proxy's SSH host key. When unset,
 //	                     ssh-proxyd generates an ephemeral key at
@@ -97,7 +101,10 @@
 //	                     Falls back to SSH_PROXYD_WORKLOAD_CA.
 //	SSH_PROXYD_WORKLOAD_CA  CA PEM used as the fallback CA bundle for
 //	                     NATS verification. One workload CA per
-//	                     deployment is the common case.
+//	                     deployment is the common case. The operational
+//	                     log-shipping connection (via the shared base cli
+//	                     helper) also falls back NATS_CERT/_KEY →
+//	                     WORKLOAD_CERT/_KEY for its client identity.
 //
 //	SSH_PROXYD_CAST_DIR  Directory where asciinema cast files are
 //	                     written, one per recorded session. When
@@ -131,17 +138,16 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
 	"github.com/abagile/tokyo3-base/tls/reloader"
+	"github.com/abagile/tokyo3-base/version"
 	"github.com/google/uuid"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -159,6 +165,8 @@ import (
 const appName = "ssh-proxyd"
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
+// version.Resolve falls back to runtime/debug.BuildInfo when ldflags
+// injection is absent (e.g. `go install …@vX.Y.Z`).
 var Version = "dev"
 
 func main() {
@@ -187,13 +195,9 @@ func serveCmd() *cobra.Command {
 }
 
 func runServe(ctx context.Context) error {
-	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{App: appName}, applog.NATSConfig{
-		URL:      os.Getenv("SSH_PROXYD_NATS_URL"),
-		CertFile: os.Getenv("SSH_PROXYD_NATS_CERT"),
-		KeyFile:  os.Getenv("SSH_PROXYD_NATS_KEY"),
-		CAFile:   envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
-	}, applog.WithStdout())
-	defer drainLog()
+	rt := cli.App{Name: appName, EnvPrefix: "SSH_PROXYD"}.Setup(ctx)
+	defer rt.Shutdown()
+	log := rt.Log
 
 	addr := envutil.Or("SSH_PROXYD_ADDR", ":2222")
 
@@ -294,7 +298,10 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("ssh server: %w", err)
 	}
 
-	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	// Derive a cancelable child of the signal-cancelled rt.Ctx so the
+	// component-coordination cancel() below (one component's exit brings
+	// the other down) composes with SIGINT/SIGTERM shutdown.
+	rootCtx, cancel := context.WithCancel(rt.Ctx)
 	defer cancel()
 
 	if revocationChecker != nil {
@@ -449,7 +456,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version and exit",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Printf("%s %s\n", appName, Version)
+			fmt.Printf("%s %s\n", appName, version.Resolve(Version))
 		},
 	}
 }

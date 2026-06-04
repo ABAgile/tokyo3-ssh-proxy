@@ -87,6 +87,65 @@ go test -bench=. -benchmem -run=^$ ./internal/proxyd/revcheck/...
 go test -bench=. -benchmem -run=^$ ./internal/audit/...
 ```
 
+### Local dev rig (docker-compose)
+
+`docker-compose.yml` stands up the full SSH-cert pipeline for
+end-to-end testing — including certd, pulled in via `build context:
+../ca`, so a sibling clone of [tokyo3-ca](https://github.com/abagile/tokyo3-ca)
+is required at `../ca`.
+
+```sh
+make gen-certs                                  # one-time: mkcert + ssh-keygen → ./shared/certs/
+make docker-up                                  # _sync-shared + compose up
+docker compose run --rm issue-user-cert         # mint ./shared/certs/user-cert.pub
+ssh -i ./shared/certs/user -p 2222 demo@localhost
+                                                # user-cert.pub auto-picked
+docker compose logs -f ssh-proxyd ssh-tunneld
+docker compose exec natsbox nats stream view ssh_audit
+NATS_PORT=14222 make docker-up                  # override host NATS port if 4222 is taken
+make docker-down                                # stop (preserves volumes)
+make clean-all                                  # full reset
+```
+
+**Layout.** Dev material lives under `./shared/` (mirrors the
+tokyo3-auth tree so future additions slot into the same shape):
+
+```
+shared/
+  certs/
+    gen.sh                  # mkcert + ssh-keygen, host-side
+    ca.crt                  # mkcert root (host + container trust)
+    certd.{crt,key}         # certd HTTPS server cert
+    certd-signing.{key,pub} # SSH user CA (TrustedUserCAKeys on target)
+    ssh-proxyd.{crt,key}    # ssh-proxyd workload identity
+    ssh-tunneld.{crt,key}   # ssh-tunneld workload identity
+    tunnel-server.{crt,key} # ssh-proxyd's tunnel-listener cert
+    user, user.pub          # demo SSH user keypair
+    user-cert.pub           # minted by issue-user-cert (written back via bind-mount)
+  target/Dockerfile         # alpine + sshd configured for cert auth
+  scripts/issue-user-cert.sh
+```
+
+**Volume model.** `make docker-up` tar-pipes `./shared/` into a
+docker-namespaced `ssh-proxy_shared_data` named volume; every
+consumer mounts it read-only at `/shared`. `issue-user-cert` is the
+single writer — it bind-mounts `./shared/certs/` onto `/host-certs`
+so the minted user-cert.pub lands on the host next to user.key (so
+`ssh -i ./shared/certs/user` finds it automatically).
+
+**End-to-end flow.** certd signs → user presents to ssh-proxyd →
+ssh-proxyd mints per-session cert → tunneled stream lands at target
+sshd which validates against the same user CA (`certd-signing.pub`,
+pinned via `TrustedUserCAKeys`).
+
+**Healthchecks.** certd (HTTPS `/healthz`), ssh-proxyd (TCP probe on
+:2222 + :2223), target sshd (TCP probe on :22), natsbox (stream
+exists). `natsbox` stays running for the full `nats` CLI:
+`docker compose exec natsbox sh`.
+
+See `shared/certs/gen.sh`, `shared/target/Dockerfile`, and
+`shared/scripts/issue-user-cert.sh` for the moving parts.
+
 ## Layout
 
 ```
@@ -214,6 +273,16 @@ disconnected and resume on reconnect. See the per-binary godoc in
 [`cmd/ssh-proxyd/main.go`](cmd/ssh-proxyd/main.go) and
 [`cmd/ssh-tunneld/main.go`](cmd/ssh-tunneld/main.go) for the
 authoritative env-var reference.
+
+ssh-proxyd composes startup via base's `cli.App.Setup` (the logger +
+log shipping above, a `SIGINT`/`SIGTERM`-cancelled context, and an
+opt-in diagnostics server on `SSH_PROXYD_DEBUG_ADDR` — net/http/pprof +
+periodic goroutine/OS-thread stats, off unless set). Its log-shipping
+NATS client identity additionally falls back
+`SSH_PROXYD_NATS_CERT/_KEY → SSH_PROXYD_WORKLOAD_CERT/_KEY`. Both
+binaries resolve their version string through the shared
+`version.Resolve` helper; ssh-tunneld keeps its own logger wiring and
+the `SSH_TUNNELD_TLS_*` NATS fallback noted above.
 
 ## Operations
 

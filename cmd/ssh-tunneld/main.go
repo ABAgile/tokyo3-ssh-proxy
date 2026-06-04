@@ -85,6 +85,7 @@ import (
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/tls/reloader"
+	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
@@ -96,6 +97,8 @@ import (
 const appName = "ssh-tunneld"
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
+// version.Resolve falls back to runtime/debug.BuildInfo when ldflags
+// injection is absent (e.g. `go install …@vX.Y.Z`).
 var Version = "dev"
 
 func main() {
@@ -237,7 +240,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version and exit",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Printf("%s %s\n", appName, Version)
+			fmt.Printf("%s %s\n", appName, version.Resolve(Version))
 		},
 	}
 }
