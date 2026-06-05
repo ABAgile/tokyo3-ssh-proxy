@@ -167,21 +167,6 @@ func (r *Registry) Open(ctx context.Context, host string) (net.Conn, error) {
 	return stream, nil
 }
 
-// Hosts returns a snapshot of every registered host label, sorted.
-// Useful for admin endpoints and tests; the cost is one allocation.
-func (r *Registry) Hosts() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.tunnels))
-	for h := range r.tunnels {
-		out = append(out, h)
-	}
-	// Sort for stable assertions / output. Imported lazily — the
-	// hot path is Lookup, which doesn't allocate.
-	sortStrings(out)
-	return out
-}
-
 // Len returns the current host label count. Constant-time.
 func (r *Registry) Len() int {
 	r.mu.RLock()
@@ -237,16 +222,6 @@ func evictSession(tunnels map[string]*entry, session *yamux.Session) {
 	for h, e := range tunnels {
 		if e.session == session {
 			delete(tunnels, h)
-		}
-	}
-}
-
-// sortStrings sorts in place. Wrapped to keep the import surface of
-// this file minimal — Lookup is the hot path, Hosts is not.
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
 		}
 	}
 }

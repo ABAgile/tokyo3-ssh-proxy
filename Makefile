@@ -3,7 +3,7 @@
 ## Usage:
 ##   make build           Build ssh-proxyd + ssh-tunneld binaries to ./bin/
 ##   make test            Run all tests
-##   make check           Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck)
+##   make check           Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck + deadcode)
 ##   make tidy            Run go mod tidy
 ##   make gen-certs       Generate dev TLS material + SSH keys in ./certs/ via mkcert (host-side)
 ##   make docker-build    Build the proxy Docker image (linux/arm64, default)
@@ -110,7 +110,7 @@ vet:
 lint:
 	staticcheck ./...
 
-## check: Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck)
+## check: Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck + deadcode)
 check:
 	gofmt -s -w .
 	$(GO) test ./... -count=1
@@ -118,6 +118,7 @@ check:
 	staticcheck ./...
 	find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
 	govulncheck ./...
+	@out=$$(deadcode -test ./...); if [ -n "$$out" ]; then echo "$$out"; echo "deadcode: unreachable functions found (above)"; exit 1; fi
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 

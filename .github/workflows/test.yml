@@ -25,9 +25,14 @@ jobs:
           which staticcheck || go install honnef.co/go/tools/cmd/staticcheck@latest
           which gopls       || go install golang.org/x/tools/gopls@latest
           which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
+          which deadcode    || go install golang.org/x/tools/cmd/deadcode@latest
 
       - run: go vet ./...
       - run: staticcheck ./...
       - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
       - run: go test ./... -count=1
       - run: govulncheck ./...
+      - name: deadcode
+        run: |
+          out=$(deadcode -test ./...)
+          if [ -n "$out" ]; then echo "$out"; echo "deadcode: unreachable functions found (above)"; exit 1; fi
