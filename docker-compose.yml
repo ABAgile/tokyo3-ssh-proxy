@@ -1,0 +1,272 @@
+# docker-compose.yml — full-coverage local-test rig for ssh-proxy.
+#
+# Brings up the entire SSH-cert flow end-to-end:
+#
+#                 ┌──────────────┐
+#   user ──SSH──► │  ssh-proxyd  │ ──mTLS────► certd ──signs──► (per-session user cert)
+#                 └──────┬───────┘                ▲
+#                        │                        │ mTLS
+#                        │ yamux/mTLS             │
+#                        ▼                        │
+#                 ┌──────────────┐          ┌─────┴───────┐
+#                 │ ssh-tunneld  │ ──tcp──► │ target sshd │  (trusts certd's user CA)
+#                 └──────────────┘ 127.0.0.1:22 └─────────┘
+#
+# certd is referenced via build context = ../ca/ so this rig also
+# exercises the cert authority end of the pipeline. Audit + log
+# shipping land in NATS JetStream; both ssh_audit and ca_audit
+# streams are pre-provisioned by natsbox, which also stays running
+# for interactive inspection.
+#
+# ── Layout ────────────────────────────────────────────────────────────────────
+#
+# Dev material lives under ./shared/ (mirrors the tokyo3-auth layout
+# so future additions slot into the same tree). `make docker-up`
+# tar-pipes ./shared/ into the shared_data named volume, and every
+# read-only consumer mounts it at /shared. issue-user-cert is the
+# only writer — it additionally bind-mounts ./shared/certs onto
+# /host-certs so the minted user-cert.pub lands on the host (for
+# `ssh -i ./shared/certs/user`).
+#
+#   ./shared/
+#     certs/
+#       gen.sh                      # mkcert + ssh-keygen, host-side
+#       ca.crt                      # mkcert root (host + container trust)
+#       certd.{crt,key}             # certd HTTPS server cert
+#       certd-signing.key           # SSH user CA signing key
+#       certd-signing.key.pub       # SSH user CA pubkey (TrustedUserCAKeys on target)
+#       ssh-proxyd.{crt,key}        # ssh-proxyd workload identity
+#       ssh-tunneld.{crt,key}       # ssh-tunneld workload identity
+#       tunnel-server.{crt,key}     # ssh-proxyd's tunnel-listener cert
+#       user, user.pub              # demo SSH user keypair
+#       user-cert.pub               # minted on demand by issue-user-cert
+#     target/Dockerfile             # alpine + sshd configured for cert auth
+#     scripts/issue-user-cert.sh    # one-shot user-cert minter
+#
+# ── Pre-flight ────────────────────────────────────────────────────────────────
+#
+# A sibling clone of tokyo3-ca is required at ../ca/ (certd is built
+# from there).
+#
+# ── Quick start ───────────────────────────────────────────────────────────────
+#
+#     make gen-certs                                  # one-time: mkcert + ssh-keygen
+#     make docker-up                                  # _sync-shared + compose up
+#     docker compose run --rm issue-user-cert         # mint user-cert.pub
+#     ssh -i ./shared/certs/user -p 2222 demo@localhost
+#                                                     # user-cert.pub auto-picked
+#
+# ── Inspect ───────────────────────────────────────────────────────────────────
+#
+#     docker compose logs -f ssh-proxyd ssh-tunneld
+#     docker compose exec natsbox nats stream view ssh_audit
+#     docker compose exec natsbox nats stream view ca_audit
+#     # NATS_PORT=14222 make docker-up                 # override host NATS port
+#
+# ── Tear down ─────────────────────────────────────────────────────────────────
+#
+#     make docker-down                # preserve volumes
+#     make clean-all                  # nukes ./bin, ./shared/certs/*.{crt,key,pub},
+#                                     # user, user-cert.pub, AND the named volumes
+
+services:
+
+  # ── NATS JetStream broker ────────────────────────────────────────────────────
+  # NATS_PORT defaults to 4222 (in-network port). Override for the
+  # host side when 4222 is taken:
+  #     NATS_PORT=14222 make docker-up
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── natsbox: stream provisioner + interactive shell ─────────────────────────
+  # Creates ssh_audit + ca_audit streams on boot, then stays running:
+  #     docker compose exec natsbox nats stream view ssh_audit
+  #     docker compose exec natsbox sh
+  natsbox:
+    image: natsio/nats-box:${NATSBOX_VERSION:-0.19.5}
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # $$ escapes compose interpolation; runtime sh sees single $.
+        for stream in ssh_audit ca_audit; do
+          subject="$${stream%_audit}.audit.events"
+          nats stream info "$$stream" > /dev/null 2>&1 || \
+            nats stream add "$$stream" \
+              --subjects "$$subject" \
+              --retention limits \
+              --storage file \
+              --max-age 9600h \
+              --deny-delete \
+              --deny-purge \
+              --defaults
+        done
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "nats stream info ssh_audit > /dev/null 2>&1 && nats stream info ca_audit > /dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── certd: built from ../ca/ for full-coverage cross-repo testing ────────────
+  certd:
+    build:
+      context: ../ca
+      target: server
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      nats:
+        condition: service_healthy
+      natsbox:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+    environment:
+      CERTD_ADDR: ":8443"
+      CERTD_API_CERT: /shared/certs/certd.crt
+      CERTD_API_KEY: /shared/certs/certd.key
+      CERTD_CA_KEY_FILE: /shared/certs/certd-signing.key
+      CERTD_NATS_URL: nats://nats:4222
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/healthz > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── ssh-proxyd: the user-facing SSH gateway ──────────────────────────────────
+  ssh-proxyd:
+    build:
+      context: .
+      target: proxy
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      certd:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+    environment:
+      SSH_PROXYD_ADDR: ":2222"
+      SSH_PROXYD_USER_CA: /shared/certs/certd-signing.key.pub
+      CERTD_URL: https://certd:8443
+      CERTD_MTLS_CERT: /shared/certs/ssh-proxyd.crt
+      CERTD_MTLS_KEY: /shared/certs/ssh-proxyd.key
+      CERTD_CA_BUNDLE: /shared/certs/ca.crt
+      SSH_PROXYD_TUNNEL_ADDR: ":2223"
+      SSH_PROXYD_TUNNEL_TLS_CERT: /shared/certs/tunnel-server.crt
+      SSH_PROXYD_TUNNEL_TLS_KEY: /shared/certs/tunnel-server.key
+      SSH_PROXYD_TUNNEL_CLIENT_CA: /shared/certs/ca.crt
+      SSH_PROXYD_NATS_URL: nats://nats:4222
+    ports:
+      - "2222:2222"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2222 && nc -z 127.0.0.1 2223"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── target sshd: the destination machine ─────────────────────────────────────
+  # Trusts certd's user CA via TrustedUserCAKeys (pinned to
+  # /shared/certs/certd-signing.key.pub). ssh-tunneld dials in on
+  # 127.0.0.1:22 and proxies the inbound stream from ssh-proxyd.
+  target:
+    build:
+      context: shared/target
+    volumes:
+      - shared_data:/shared:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── ssh-tunneld: the per-host reverse-tunnel agent ───────────────────────────
+  # Co-located with `target` via network_mode: service:target so its
+  # 127.0.0.1:22 is the target's sshd. Outbound mTLS+yamux to
+  # ssh-proxyd's tunnel listener.
+  ssh-tunneld:
+    build:
+      context: .
+      target: tunneld
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      ssh-proxyd:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    network_mode: "service:target"
+    volumes:
+      - shared_data:/shared:ro
+    environment:
+      SSH_TUNNELD_PROXY_ADDR: ssh-proxyd:2223
+      SSH_TUNNELD_PROXY_SERVER_NAME: ssh-proxyd
+      SSH_TUNNELD_TLS_CERT: /shared/certs/ssh-tunneld.crt
+      SSH_TUNNELD_TLS_KEY: /shared/certs/ssh-tunneld.key
+      SSH_TUNNELD_TLS_CA: /shared/certs/ca.crt
+      SSH_TUNNELD_LOCAL_SSHD: "127.0.0.1:22"
+      SSH_TUNNELD_NATS_URL: nats://nats:4222
+    restart: unless-stopped
+
+  # ── issue-user-cert: one-shot helper to mint the user SSH cert ───────────────
+  # Run on demand:
+  #     docker compose run --rm issue-user-cert
+  # Reads ssh-proxyd's workload identity from shared_data, POSTs to
+  # certd's /api/v1/ssh/sign-user, and writes the minted cert to
+  # /host-certs/user-cert.pub — bind-mounted onto ./shared/certs/ on
+  # the host so the host's ssh client finds it next to user.key.
+  issue-user-cert:
+    image: alpine:3.21
+    profiles: ["tools"]
+    depends_on:
+      certd:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+      - ./shared/certs:/host-certs:rw
+    entrypoint: /bin/sh
+    command: -c "apk add --no-cache curl openssh-keygen && /shared/scripts/issue-user-cert.sh"
+
+volumes:
+  # ── shared_data (external — Makefile-owned) ──────────────────────────────────
+  # Owned by the Makefile, NOT compose: `make _sync-shared` creates this
+  # volume and tar-pipes ./shared/ into it BEFORE `docker compose up`
+  # runs. Declared external so compose mounts that already-populated
+  # volume instead of creating its own empty one — a compose-created
+  # volume left certd/sshd reading an empty /shared ("certd-signing.key
+  # not found"). External volumes skip the <project>_ prefix, so `name:`
+  # pins the compose-namespaced name explicitly; ${COMPOSE_PROJECT_NAME}
+  # (exported by the Makefile, defaulting to "ssh-proxy") keeps it in
+  # lockstep with _sync-shared's SHARED_VOLUME. `make clean-all` removes it.
+  shared_data:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-ssh-proxy}_shared_data
+  nats-data:

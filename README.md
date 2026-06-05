@@ -116,7 +116,8 @@ shared/
     gen.sh                  # mkcert + ssh-keygen, host-side
     ca.crt                  # mkcert root (host + container trust)
     certd.{crt,key}         # certd HTTPS server cert
-    certd-signing.{key,pub} # SSH user CA (TrustedUserCAKeys on target)
+    certd-signing.key       # SSH user CA signing key
+    certd-signing.key.pub   # SSH user CA pubkey (TrustedUserCAKeys on target)
     ssh-proxyd.{crt,key}    # ssh-proxyd workload identity
     ssh-tunneld.{crt,key}   # ssh-tunneld workload identity
     tunnel-server.{crt,key} # ssh-proxyd's tunnel-listener cert
@@ -135,7 +136,7 @@ so the minted user-cert.pub lands on the host next to user.key (so
 
 **End-to-end flow.** certd signs → user presents to ssh-proxyd →
 ssh-proxyd mints per-session cert → tunneled stream lands at target
-sshd which validates against the same user CA (`certd-signing.pub`,
+sshd which validates against the same user CA (`certd-signing.key.pub`,
 pinned via `TrustedUserCAKeys`).
 
 **Healthchecks.** certd (HTTPS `/healthz`), ssh-proxyd (TCP probe on
