@@ -110,7 +110,25 @@
 //	                     written, one per recorded session. When
 //	                     unset, session recording is disabled — the
 //	                     proxy still forwards traffic but produces
-//	                     no audit cast files.
+//	                     no audit cast files. Also serves as the root
+//	                     the admin portal replays casts from (see
+//	                     SSH_PROXYD_PORTAL_ADDR); unset disables replay.
+//
+//	SSH_PROXYD_PORTAL_ADDR  Listen address for the admin portal — a
+//	                     read-only web UI listing recorded SSH sessions
+//	                     with in-browser asciinema replay (e.g.
+//	                     "127.0.0.1:8080"). Unset ⇒ the portal is not
+//	                     started. The session list tails ssh-proxyd's
+//	                     own ssh_audit stream (needs SSH_PROXYD_NATS_URL);
+//	                     replay needs SSH_PROXYD_CAST_DIR. This is
+//	                     ssh-proxyd's only HTTP surface — keep it off the
+//	                     public internet or behind an identity-aware edge.
+//	SSH_PROXYD_PORTAL_USERNAME  Optional HTTP Basic-auth username for the
+//	                     portal. The gate activates only when both this
+//	                     and SSH_PROXYD_PORTAL_PASSWORD are set; otherwise
+//	                     the portal is open (front it with oauth2-proxy or
+//	                     similar). /healthz is always exempt.
+//	SSH_PROXYD_PORTAL_PASSWORD  Matching Basic-auth password.
 //
 //	SSH_PROXYD_TUNNEL_ADDR  Listen address for inbound mTLS+yamux
 //	                     tunnels from ssh-tunneld instances (e.g.,
@@ -137,6 +155,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -145,7 +164,9 @@ import (
 
 	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/journal"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
+	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/google/uuid"
@@ -156,6 +177,7 @@ import (
 
 	"github.com/abagile/tokyo3-ssh-proxy/internal/audit"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/common/certclient"
+	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/portal"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/recording"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/revcheck"
 	"github.com/abagile/tokyo3-ssh-proxy/internal/proxyd/routing"
@@ -298,6 +320,73 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("ssh server: %w", err)
 	}
 
+	// Optional admin portal: recorded-session list + asciinema replay.
+	// Runs on its own HTTP listener and is skipped entirely when
+	// SSH_PROXYD_PORTAL_ADDR is unset. The session list + audit viewer
+	// each tail ssh-proxyd's own ssh_audit stream (empty until NATS is
+	// wired); replay streams casts from SSH_PROXYD_CAST_DIR.
+	var portalSrv *http.Server
+	var sessionTracker *portal.SessionTracker
+	var auditTracker *portal.AuditTracker
+	if portalAddr := os.Getenv("SSH_PROXYD_PORTAL_ADDR"); portalAddr != "" {
+		sessionSource, err := openSSHAuditSource(log)
+		if err != nil {
+			return fmt.Errorf("portal session source: %w", err)
+		}
+		defer envutil.CloseIfCloser(sessionSource)
+		sessionTracker, err = newSessionTracker(log, sessionSource)
+		if err != nil {
+			return fmt.Errorf("portal session tracker: %w", err)
+		}
+		// A typed-nil tracker must not reach the store interface (a
+		// non-nil interface wrapping a nil pointer would panic on
+		// render) — only assign when the tracker is actually live.
+		var sessionStore portal.SessionStore
+		if sessionTracker != nil {
+			sessionStore = sessionTracker
+		}
+		// Separate ssh_audit consumer for the audit viewer (all event
+		// types, vs. the session tracker's recording.completed filter).
+		auditSource, err := openSSHAuditSource(log)
+		if err != nil {
+			return fmt.Errorf("portal audit source: %w", err)
+		}
+		defer envutil.CloseIfCloser(auditSource)
+		auditTracker, err = newAuditTracker(log, auditSource)
+		if err != nil {
+			return fmt.Errorf("portal audit tracker: %w", err)
+		}
+		var auditStore portal.AuditStore
+		if auditTracker != nil {
+			auditStore = auditTracker
+		}
+		castStore, err := loadPortalCastStore(log)
+		if err != nil {
+			return fmt.Errorf("portal cast store: %w", err)
+		}
+		portalSvc, err := portal.New(portal.Config{
+			Version:      version.Resolve(Version),
+			Log:          log,
+			SessionStore: sessionStore,
+			CastStore:    castStore,
+			AuditStore:   auditStore,
+			BasicAuth: portal.BasicAuthConfig{
+				Username: os.Getenv("SSH_PROXYD_PORTAL_USERNAME"),
+				Password: os.Getenv("SSH_PROXYD_PORTAL_PASSWORD"),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("portal: %w", err)
+		}
+		portalSrv = &http.Server{
+			Addr:              portalAddr,
+			Handler:           portalSvc.Routes(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		authed := os.Getenv("SSH_PROXYD_PORTAL_USERNAME") != "" && os.Getenv("SSH_PROXYD_PORTAL_PASSWORD") != ""
+		log.Info("admin portal enabled", "addr", portalAddr, "basic_auth", authed)
+	}
+
 	// Derive a cancelable child of the signal-cancelled rt.Ctx so the
 	// component-coordination cancel() below (one component's exit brings
 	// the other down) composes with SIGINT/SIGTERM shutdown.
@@ -308,6 +397,24 @@ func runServe(ctx context.Context) error {
 		go func() {
 			if err := revocationChecker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("revocation poller exited", "err", err)
+			}
+		}()
+	}
+
+	// Portal session tracker + audit tracker each subscribe + tail
+	// ssh_audit (sessions filter to recording.completed; audit shows
+	// all event types). Both exit on rootCtx cancel.
+	if sessionTracker != nil {
+		go func() {
+			if err := sessionTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("session tracker exited", "err", err)
+			}
+		}()
+	}
+	if auditTracker != nil {
+		go func() {
+			if err := auditTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("audit tracker exited", "err", err)
 			}
 		}()
 	}
@@ -336,16 +443,17 @@ func runServe(ctx context.Context) error {
 	// Run the tunnel listener alongside the SSH server when one is
 	// configured. Either component's exit cancels rootCtx so the
 	// other unwinds cleanly.
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
+	expected := 1 // the SSH server always runs
 	if tunnelListener != nil {
+		expected++
 		go func() { errCh <- tunnelListener.ListenAndServe(rootCtx) }()
 	}
-	go func() { errCh <- srv.ListenAndServe(rootCtx) }()
-
-	expected := 1
-	if tunnelListener != nil {
-		expected = 2
+	if portalSrv != nil {
+		expected++
+		go func() { errCh <- runPortal(rootCtx, portalSrv) }()
 	}
+	go func() { errCh <- srv.ListenAndServe(rootCtx) }()
 	var firstErr error
 	for i := 0; i < expected; i++ {
 		err := <-errCh
@@ -855,6 +963,105 @@ func loadRecordingSink(log *slog.Logger) (recording.Sink, error) {
 	}
 	log.Info("session recording enabled", "root", sink.Root())
 	return sink, nil
+}
+
+// runPortal serves the admin portal until ctx is cancelled, then
+// gracefully drains in-flight requests. http.ErrServerClosed (the
+// expected result of Shutdown) is folded to nil so it doesn't read as
+// a fatal listener error in the coordination loop.
+func runPortal(ctx context.Context, srv *http.Server) error {
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// openSSHAuditSource builds a JetStream source on ssh-proxyd's own
+// ssh_audit stream — the portal's session tracker and audit viewer
+// each open one. Reuses the SSH_PROXYD_NATS_* connection material the
+// audit publisher already uses. Returns (nil, nil) when no NATS URL is
+// configured, so the portal still serves (with empty session + audit
+// lists) without a broker.
+func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
+	url := os.Getenv("SSH_PROXYD_NATS_URL")
+	if url == "" {
+		log.Warn("SSH_PROXYD_NATS_URL unset — portal session list + audit viewer will be empty (no ssh_audit stream to tail)")
+		return nil, nil
+	}
+	var tlsCfg *tls.Config
+	if cert := os.Getenv("SSH_PROXYD_NATS_CERT"); cert != "" {
+		cfg, err := btls.FromFiles(
+			cert,
+			os.Getenv("SSH_PROXYD_NATS_KEY"),
+			envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("ssh-audit source TLS: %w", err)
+		}
+		tlsCfg = cfg
+	}
+	source, err := jetstream.NewSource(jetstream.SourceConfig{
+		URL:        url,
+		StreamName: audit.StreamName,
+		Subject:    audit.Subject,
+		TLS:        tlsCfg,
+		Log:        log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ssh-audit source: %w", err)
+	}
+	log.Info("portal ssh-audit source configured", "url", url)
+	return source, nil
+}
+
+// newSessionTracker wraps source in the portal session tracker. A nil
+// source short-circuits to nil so callers don't need to nil-check.
+func newSessionTracker(log *slog.Logger, source journal.Source) (*portal.SessionTracker, error) {
+	if source == nil {
+		return nil, nil
+	}
+	return portal.NewSessionTracker(portal.SessionTrackerConfig{
+		Source:       source,
+		SubjectLabel: audit.Subject,
+		Log:          log,
+	})
+}
+
+// newAuditTracker wraps source in the portal audit tracker (the
+// /audit viewer over ssh-proxyd's own ssh_audit stream). A nil source
+// short-circuits to nil so callers don't need to nil-check.
+func newAuditTracker(log *slog.Logger, source journal.Source) (*portal.AuditTracker, error) {
+	if source == nil {
+		return nil, nil
+	}
+	return portal.NewAuditTracker(portal.AuditTrackerConfig{
+		Source: source,
+		Log:    log,
+	})
+}
+
+// loadPortalCastStore returns the cast store the portal replays from,
+// rooted at SSH_PROXYD_CAST_DIR (the same directory the recorder
+// writes to). Returns (nil, nil) when unset — the session-detail page
+// then hides its player and /sessions/{id}/cast returns 503.
+func loadPortalCastStore(log *slog.Logger) (portal.CastStore, error) {
+	dir := os.Getenv("SSH_PROXYD_CAST_DIR")
+	if dir == "" {
+		log.Warn("SSH_PROXYD_CAST_DIR unset — portal replay disabled (session list still renders)")
+		return nil, nil
+	}
+	store, err := portal.NewLocalCastStore(dir)
+	if err != nil {
+		return nil, fmt.Errorf("portal cast store: %w", err)
+	}
+	log.Info("portal replay enabled", "root", store.Root())
+	return store, nil
 }
 
 // loadTargetHostKeyCallback returns the callback used to verify the

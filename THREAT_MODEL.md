@@ -56,6 +56,7 @@ Trust boundaries:
 | ssh-tunneld → certd    | HTTPS mTLS              | Workload identity → host-cert role                 |
 | ssh-proxyd → NATS      | mTLS publish            | Workload identity → publisher role                 |
 | Recording → disk       | Filesystem              | File-mode 0600 cast files (audit data)             |
+| User → portal HTTP     | Inbound HTTP            | Optional Basic auth; read-only session list + casts |
 
 ## Surfaces and threats
 
@@ -143,7 +144,25 @@ Threats:
 | 2 | Sensitive data in audit payload                 | `audit.Entry` fields are typed; metadata is JSON-encoded explicitly per event. No raw key material is ever placed in `Metadata` (review checklist below).                                           |
 | 3 | Audit-publish failure masks a breach            | Failures are logged at warn but never block the wire — accepted because a recording session must complete cleanly. Operators alert on broker unavailability.                                        |
 
-## Residual risks (known + tracked)
+### S7. Admin portal HTTP surface
+**Surface:** Optional read-only web UI on `SSH_PROXYD_PORTAL_ADDR`
+(`internal/proxyd/portal`) — recorded-session list + asciinema cast
+replay, plus an `/audit` viewer tailing the `ssh_audit` stream.
+ssh-proxyd's only HTTP listener; unset ⇒ not started. All routes are
+GET (read-only) and share the same Basic-auth gate + `html/template`
+escaping covered below.
+
+Threats:
+
+| # | Threat                                                  | Mitigation                                                                                                                                                                                          |
+|---|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | Anonymous access to session recordings                  | Optional HTTP Basic gate (`requireBasicAuth`, `portal/auth.go`): active when `SSH_PROXYD_PORTAL_USERNAME` + `_PASSWORD` are set, constant-time compared. When unset the portal is open by design — operators MUST front it with an identity-aware edge and keep it off the public internet. `/healthz` is exempt. |
+| 2 | Path traversal serving arbitrary files via a hostile `recording_path` | `LocalCastStore.Open` (`portal/cast.go`) resolves the requested path through `filepath.EvalSymlinks` and refuses anything outside `SSH_PROXYD_CAST_DIR` with `ErrCastOutsideRoot` → HTTP 403. Tests `TestLocalCastStore_RejectsTraversal` / `_RejectsPathOutsideRoot` pin the guard. |
+| 3 | XSS via session metadata rendered in HTML               | Pages render through `html/template`, which context-escapes every interpolated value (user, target, principals, recording path — all sourced from cert KeyIDs + audit events).                       |
+| 4 | CSRF / state mutation                                   | The portal is read-only — every route is `GET` and nothing mutates server state — so there is no CSRF surface.                                                                                       |
+| 5 | Slow-loris / header DoS on the listener                 | `http.Server.ReadHeaderTimeout` (10s) caps how long a single connection can occupy a request goroutine before headers are read.                                                                     |
+
+
 
 1. **No per-session disk-size cap** on cast files. Set OS quotas.
 2. **Subsystem detection** is exec/payload-prefix based — operator-renamed binaries bypass it.
@@ -171,3 +190,4 @@ When reviewing ssh-proxy changes, walk through:
 4. Does it touch the tunnel listener? Confirm `HostFromSPIFFE` is used (or a tested equivalent); operators don't lose audit attribution.
 5. Does it add audit events? Add the new Action constant to `internal/audit/audit.go` AND surface it in this document.
 6. Does it add an env var? Document in `cmd/ssh-proxyd/main.go` (or `cmd/ssh-tunneld/main.go`) AND in README.
+7. Does it touch the admin portal? Keep routes read-only (GET); render through `html/template`; serve casts only via `LocalCastStore.Open` (root-prefix guard); confirm the Basic-auth gate still wraps every non-`/healthz` route.

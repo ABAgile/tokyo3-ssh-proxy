@@ -62,6 +62,10 @@
 #     docker compose exec natsbox nats stream view ssh_audit
 #     docker compose exec natsbox nats stream view ca_audit
 #     # NATS_PORT=14222 make docker-up                 # override host NATS port
+#     curl -u admin:devportal http://localhost:8090/sessions
+#                                     # ssh-proxyd admin portal: recorded
+#                                     # sessions + asciinema replay (open in a
+#                                     # browser after one PTY session above)
 #
 # ── Tear down ─────────────────────────────────────────────────────────────────
 #
@@ -169,6 +173,7 @@ services:
         condition: service_healthy
     volumes:
       - shared_data:/shared:ro
+      - cast-data:/casts
     environment:
       SSH_PROXYD_ADDR: ":2222"
       SSH_PROXYD_USER_CA: /shared/certs/certd-signing.key.pub
@@ -181,8 +186,14 @@ services:
       SSH_PROXYD_TUNNEL_TLS_KEY: /shared/certs/tunnel-server.key
       SSH_PROXYD_TUNNEL_CLIENT_CA: /shared/certs/ca.crt
       SSH_PROXYD_NATS_URL: nats://nats:4222
+      # Session recording + admin portal (sessions list + asciinema replay).
+      SSH_PROXYD_CAST_DIR: /casts
+      SSH_PROXYD_PORTAL_ADDR: ":8090"
+      SSH_PROXYD_PORTAL_USERNAME: admin
+      SSH_PROXYD_PORTAL_PASSWORD: devportal
     ports:
       - "2222:2222"
+      - "8090:8090"
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 2222 && nc -z 127.0.0.1 2223"]
       interval: 10s
@@ -269,4 +280,8 @@ volumes:
   shared_data:
     external: true
     name: ${COMPOSE_PROJECT_NAME:-ssh-proxy}_shared_data
+  # cast-data — compose-owned, writeable. ssh-proxyd records asciinema
+  # casts here (SSH_PROXYD_CAST_DIR) and the admin portal replays them
+  # from the same root. `make clean-all` removes it with the project.
+  cast-data:
   nats-data:

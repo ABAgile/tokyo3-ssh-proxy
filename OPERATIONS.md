@@ -58,6 +58,14 @@ reachable without exposing inbound port 22.
 7. **Revocation polling:** `CERTD_REVOCATIONS_URL` + reuse the
    `CERTD_MTLS_*` material. Without this **revoked certs that are
    otherwise valid will still be accepted** — wire it in production.
+8. **Admin portal (optional):** `SSH_PROXYD_PORTAL_ADDR` (e.g.
+   `127.0.0.1:8090`) starts the recorded-session list + asciinema
+   replay UI **and the `/audit` event viewer**. Both the session list
+   and `/audit` need `SSH_PROXYD_NATS_URL` (they tail `ssh_audit`);
+   replay reuses `SSH_PROXYD_CAST_DIR` (step 5). Gate it
+   with `SSH_PROXYD_PORTAL_USERNAME` + `SSH_PROXYD_PORTAL_PASSWORD`, or
+   front it with an identity-aware proxy — it serves session
+   recordings, so keep it off the public internet.
 
 ### ssh-tunneld (per target host)
 
@@ -125,6 +133,21 @@ Walk down this list:
    full filesystem, `OpenCast` fails. Audit shows
    `recording.completed` never fires; the session itself may
    still work but the channel close path logs warn.
+
+### Diagnose "the portal session can't replay"
+
+1. **`SSH_PROXYD_CAST_DIR` not configured** — the session-detail page
+   shows "the cast store is not configured" and hides the player; the
+   cast endpoint returns 503. Set the env var (same root the recorder
+   writes to) and restart.
+2. **Session not in the list** — the in-memory ring caps at
+   `DefaultMaxSessions` (200) and the tracker tails `ssh_audit`. If
+   `SSH_PROXYD_NATS_URL` is unset the list is empty; older sessions age
+   out of the ring and must be queried from JetStream directly.
+3. **403 on `/sessions/{id}/cast`** — the recorded path resolves
+   outside `SSH_PROXYD_CAST_DIR` (the portal logs "cast path outside
+   configured root"). Confirm the recorder and portal share one cast
+   root; a 403 here is the path-traversal guard doing its job.
 
 ### Recover from a NATS outage
 
@@ -337,6 +360,7 @@ again.
 | ssh-tunneld logs                       | `tunnel connected` / `tunnel session ended; reconnecting`     |
 | Cast directory size                    | Grows monotonically; set OS-level quotas before disk full     |
 | `revcheck` warn log "refresh failed"   | Burst indicates certd outage or wrong CERTD_REVOCATIONS_URL   |
+| ssh-proxyd portal `/healthz` + `/sessions` | Portal is up; recorded sessions are listed (when enabled) |
 | portal /audit (in certd)               | Cross-stream view of session opens, channel rejections, etc.  |
 
 ## 6. Known limitations
@@ -345,7 +369,9 @@ again.
   proxies (see "Bring up a new instance" above).
 - **No replay queue** for audit emissions when NATS is down.
 - **In-memory recording metadata** — restart drops the ring; query
-  JetStream for older sessions.
+  JetStream for older sessions. The admin portal's session list shares
+  this limit (caps at `DefaultMaxSessions`, 200) and is per-process —
+  each proxy shows only the sessions it recorded.
 - **No SCP/SFTP inner-protocol parsing** — `subsystem.opened`
   events log the kickoff but per-file paths aren't captured.
 - **Cast disk growth is unbounded** without OS quotas — set them.

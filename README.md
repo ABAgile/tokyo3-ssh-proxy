@@ -102,10 +102,17 @@ ssh -i ./shared/certs/user -p 2222 demo@localhost
                                                 # user-cert.pub auto-picked
 docker compose logs -f ssh-proxyd ssh-tunneld
 docker compose exec natsbox nats stream view ssh_audit
+open http://localhost:8090/sessions             # admin portal (Basic auth admin:devportal)
 NATS_PORT=14222 make docker-up                  # override host NATS port if 4222 is taken
 make docker-down                                # stop (preserves volumes)
 make clean-all                                  # full reset
 ```
+
+The rig enables recording (`SSH_PROXYD_CAST_DIR=/casts`, a `cast-data`
+volume) and the admin portal on `:8090` (Basic auth `admin:devportal`).
+After one PTY session through the proxy, the portal's
+[`/sessions`](http://localhost:8090/sessions) page lists it with
+in-browser asciinema replay.
 
 **Layout.** Dev material lives under `./shared/` (mirrors the
 tokyo3-auth tree so future additions slot into the same shape):
@@ -237,6 +244,47 @@ can be correlated.
 `recording.completed` carries the absolute cast path and metadata with
 `duration_seconds` and `started_at`. Audit emission is best-effort —
 failures are logged but never block the wire.
+
+## Admin portal
+
+ssh-proxyd serves an optional read-only web UI — a list of recorded SSH
+sessions with in-browser asciinema replay, plus a live audit-event
+viewer. It's ssh-proxyd's only HTTP surface and is **off by default**:
+set `SSH_PROXYD_PORTAL_ADDR` (e.g. `127.0.0.1:8090`) to start it.
+
+| Route                   | Serves                                                      |
+|-------------------------|-------------------------------------------------------------|
+| `GET /`                 | Landing page.                                               |
+| `GET /healthz`          | Liveness probe (always open, exempt from auth).             |
+| `GET /sessions`         | Recent recorded sessions, newest first.                     |
+| `GET /sessions/{id}`    | Session metadata + an asciinema-player embed.               |
+| `GET /sessions/{id}/cast` | Raw asciinema cast stream the player loads.               |
+| `GET /audit`            | Live tail of the `ssh_audit` stream (all event types).      |
+
+- **Session list** is hydrated by a [`SessionTracker`] that tails
+  ssh-proxyd's own `ssh_audit` JetStream stream (the
+  `recording.completed` events) into a bounded in-memory ring
+  (`DefaultMaxSessions`, 200; older sessions age out and must be queried
+  from JetStream directly). Needs `SSH_PROXYD_NATS_URL`; without it the
+  page renders empty.
+- **Audit viewer** (`/audit`) is hydrated by an `AuditTracker` tailing
+  the same `ssh_audit` stream (a separate consumer) but surfacing *all*
+  event types — `session.opened`/`closed`, `channel.rejected`,
+  `recording.completed`, `port_forward.*`, `subsystem.opened` — newest
+  first in a bounded ring (`DefaultMaxAuditEvents`, 500). Denials show
+  their reason inline; other events expose the raw metadata blob. Also
+  needs `SSH_PROXYD_NATS_URL`.
+- **Replay** streams cast files through a `LocalCastStore` rooted at
+  `SSH_PROXYD_CAST_DIR` (the same directory the recorder writes to) —
+  paths outside that root are refused with 403, sealing off the
+  file-system attack surface a hostile `recording.completed` payload
+  would otherwise open. Without `SSH_PROXYD_CAST_DIR`, the detail page
+  hides its player and `/sessions/{id}/cast` returns 503.
+- **Auth.** Setting both `SSH_PROXYD_PORTAL_USERNAME` and
+  `SSH_PROXYD_PORTAL_PASSWORD` activates an HTTP Basic gate
+  (constant-time compared; `/healthz` exempt). When unset the portal is
+  open — front it with oauth2-proxy or an identity-aware edge. The portal
+  serves session recordings, so keep it off the public internet.
 
 NATS connection is configured via `SSH_PROXYD_NATS_URL`,
 `SSH_PROXYD_NATS_CERT`, `SSH_PROXYD_NATS_KEY`, and
