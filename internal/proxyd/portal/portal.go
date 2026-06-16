@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/abagile/tokyo3-base/httpauth"
 )
 
 // Server is the portal's HTTP handler. Construct via [New] and mount
@@ -62,7 +64,7 @@ type Config struct {
 	// /healthz) must present matching Basic creds; otherwise the
 	// portal stays open and operators front it with their own
 	// identity-aware edge.
-	BasicAuth BasicAuthConfig
+	BasicAuth httpauth.BasicAuthConfig
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -110,7 +112,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}", s.handleSessionDetail)
 	mux.HandleFunc("GET /sessions/{id}/cast", s.handleSessionCast)
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
-	return requireBasicAuth(s.cfg.BasicAuth, mux)
+	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
 }
 
 // indexData is the model passed to the landing page template.

@@ -148,10 +148,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -159,13 +156,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/guard"
+	"github.com/abagile/tokyo3-base/httpauth"
 	"github.com/abagile/tokyo3-base/journal"
+	"github.com/abagile/tokyo3-base/run"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/google/uuid"
@@ -280,9 +278,11 @@ func runServe(ctx context.Context) error {
 		certdReloader.WarnIfNearExpiry(24*time.Hour, "certd-client mTLS cert near expiry — restart ssh-proxyd after the next rotation")
 	}
 
-	// Build the tunnel-server TLS reloader once when the listener
-	// is enabled. nil when SSH_PROXYD_TUNNEL_ADDR is unset.
-	tunnelReloader, err := newTunnelServerReloaderFromEnv(log)
+	// Build the tunnel-server TLS config once when the listener is
+	// enabled. nil when SSH_PROXYD_TUNNEL_ADDR is unset. reloader.ServerTLS
+	// hot-reloads the server cert per-handshake and the inbound client-CA
+	// bundle mtime-gated, so no separate poller is needed.
+	tunnelTLS, err := buildTunnelServerTLS(log)
 	if err != nil {
 		return fmt.Errorf("tunnel-server tls: %w", err)
 	}
@@ -292,7 +292,7 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("client signer: %w", err)
 	}
 
-	registry, tunnelListener, err := buildTunnelListener(log, tunnelReloader)
+	registry, tunnelListener, err := buildTunnelListener(log, tunnelTLS)
 	if err != nil {
 		return fmt.Errorf("tunnel listener: %w", err)
 	}
@@ -380,9 +380,10 @@ func runServe(ctx context.Context) error {
 			SessionStore: sessionStore,
 			CastStore:    castStore,
 			AuditStore:   auditStore,
-			BasicAuth: portal.BasicAuthConfig{
+			BasicAuth: httpauth.BasicAuthConfig{
 				Username: os.Getenv("SSH_PROXYD_PORTAL_USERNAME"),
 				Password: os.Getenv("SSH_PROXYD_PORTAL_PASSWORD"),
+				Realm:    "ssh-proxyd portal",
 			},
 		})
 		if err != nil {
@@ -429,12 +430,14 @@ func runServe(ctx context.Context) error {
 		})
 	}
 
-	// CA-bundle mtime pollers — one per reloader. Each polls every
-	// DefaultCAPollInterval and reloads its bundle on mtime advance,
+	// certd-client CA-bundle mtime poller. Polls every
+	// DefaultPollInterval and reloads its bundle on mtime advance,
 	// letting operators rotate the CA pool without restart. Exits
 	// are not treated as fatal here; they only ever return when the
 	// rootCtx cancels (typical shutdown) or after a misconfigured
-	// reloader was constructed (caught earlier).
+	// reloader was constructed (caught earlier). The tunnel-server
+	// TLS config self-reloads inside reloader.ServerTLS, so it needs
+	// no poller here.
 	if certdReloader != nil {
 		guard.Go(log, "certd-ca-poller", func() {
 			if err := certdReloader.RunPoll(rootCtx, reloader.DefaultPollInterval); err != nil && !errors.Is(err, context.Canceled) {
@@ -442,38 +445,21 @@ func runServe(ctx context.Context) error {
 			}
 		})
 	}
-	if tunnelReloader != nil {
-		guard.Go(log, "tunnel-ca-poller", func() {
-			if err := tunnelReloader.RunPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
-				log.Warn("tunnel client CA poller exited", "err", err)
-			}
-		})
-	}
 
-	// Run the tunnel listener alongside the SSH server when one is
-	// configured. Either component's exit cancels rootCtx so the
-	// other unwinds cleanly.
-	errCh := make(chan error, 3)
-	expected := 1 // the SSH server always runs
+	// Run the tunnel listener and admin portal alongside the SSH server
+	// when configured. The first component to exit cancels run.Group's
+	// child context so the rest unwind cleanly; the parent rootCtx (and
+	// thus the guard.Go pollers above) is unaffected until the deferred
+	// cancel() fires on return.
+	components := []run.Component{srv.ListenAndServe}
 	if tunnelListener != nil {
-		expected++
-		go func() { errCh <- tunnelListener.ListenAndServe(rootCtx) }()
+		components = append(components, tunnelListener.ListenAndServe)
 	}
 	if portalSrv != nil {
-		expected++
-		go func() { errCh <- runPortal(rootCtx, portalSrv) }()
+		components = append(components, run.HTTPServer(portalSrv, 5*time.Second, false))
 	}
-	go func() { errCh <- srv.ListenAndServe(rootCtx) }()
-	var firstErr error
-	for i := 0; i < expected; i++ {
-		err := <-errCh
-		if firstErr == nil && err != nil && !errors.Is(err, context.Canceled) {
-			firstErr = err
-		}
-		cancel() // bring the other component down
-	}
-	if firstErr != nil {
-		return fmt.Errorf("serve: %w", firstErr)
+	if err := run.Group(rootCtx, components...); err != nil {
+		return fmt.Errorf("serve: %w", err)
 	}
 	log.Info("stopped")
 	return nil
@@ -523,13 +509,16 @@ func buildRevocationChecker(log *slog.Logger, r *reloader.Reloader) (*revcheck.P
 // stay in sync.
 const DefaultRevocationPollInterval = 30 * time.Second
 
-// newTunnelServerReloaderFromEnv reads the inbound-listener TLS
-// envs and returns the reloader. nil when SSH_PROXYD_TUNNEL_ADDR is
-// unset (tunnel acceptance disabled). Validation of required env
-// vars is shared between the reloader construction here and the
-// buildTunnelListener call below; SSH_PROXYD_TUNNEL_ADDR is treated
-// as the master switch.
-func newTunnelServerReloaderFromEnv(log *slog.Logger) (*tunnelServerReloader, error) {
+// buildTunnelServerTLS reads the inbound-listener TLS envs and returns
+// the *tls.Config presented to connecting ssh-tunneld agents. nil when
+// SSH_PROXYD_TUNNEL_ADDR is unset (tunnel acceptance disabled).
+// reloader.ServerTLS hot-reloads the server cert per-handshake and the
+// inbound client-CA bundle mtime-gated; ClientAuth is set to
+// RequireAndVerifyClientCert so every inbound tunnel must present a
+// workload client cert chaining to the configured CA — the behaviour the
+// previous hand-rolled reloader enforced. SSH_PROXYD_TUNNEL_ADDR is the
+// master switch shared with buildTunnelListener below.
+func buildTunnelServerTLS(log *slog.Logger) (*tls.Config, error) {
 	if os.Getenv("SSH_PROXYD_TUNNEL_ADDR") == "" {
 		return nil, nil
 	}
@@ -539,26 +528,33 @@ func newTunnelServerReloaderFromEnv(log *slog.Logger) (*tunnelServerReloader, er
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("SSH_PROXYD_TUNNEL_TLS_CERT/_KEY and a tunnel client CA are required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
-	return newTunnelServerReloader(certFile, keyFile, caFile, log)
+	return reloader.ServerTLS(reloader.ServerTLSConfig{
+		CertFile:     certFile,
+		KeyFile:      keyFile,
+		ClientCAFile: caFile,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+		Log:          log,
+	})
 }
 
 // buildTunnelListener returns the routing.Registry + Listener pair
-// when SSH_PROXYD_TUNNEL_ADDR is configured. When unset (reloader
+// when SSH_PROXYD_TUNNEL_ADDR is configured. When unset (tlsConfig
 // is nil), both returns are nil — the proxy serves only direct-TCP
 // target dials.
-func buildTunnelListener(log *slog.Logger, reloader *tunnelServerReloader) (*routing.Registry, *routing.Listener, error) {
+func buildTunnelListener(log *slog.Logger, tlsConfig *tls.Config) (*routing.Registry, *routing.Listener, error) {
 	addr := os.Getenv("SSH_PROXYD_TUNNEL_ADDR")
 	if addr == "" {
 		log.Warn("SSH_PROXYD_TUNNEL_ADDR unset — tunnel acceptance disabled; all sessions use direct TCP")
 		return nil, nil, nil
 	}
-	if reloader == nil {
-		return nil, nil, errors.New("tunnel server reloader is required when SSH_PROXYD_TUNNEL_ADDR is set")
+	if tlsConfig == nil {
+		return nil, nil, errors.New("tunnel server TLS config is required when SSH_PROXYD_TUNNEL_ADDR is set")
 	}
 	registry := routing.New()
 	listener, err := routing.NewListener(routing.ListenerConfig{
 		Addr:      addr,
-		TLSConfig: reloader.TLSConfig(),
+		TLSConfig: tlsConfig,
 		Registry:  registry,
 		Log:       log,
 	})
@@ -744,186 +740,6 @@ func newCertdMinter(certdURL string, log *slog.Logger, r *reloader.Reloader) (fu
 	}, nil
 }
 
-// DefaultCAPollInterval matches the value used by cert-agentd and
-// ssh-tunneld; one number for operators to remember across the
-// platform.
-const DefaultCAPollInterval = 30 * time.Second
-
-// tunnelServerReloader owns the TLS material ssh-proxyd presents on
-// its inbound tunnel listener (server cert) plus the CA pool that
-// verifies each connecting ssh-tunneld (ClientCAs). Server cert is
-// loaded once at startup; the ClientCAs bundle is mtime-polled.
-// Verification uses the standard verifier (ClientAuth =
-// RequireAndVerifyClientCert) via [GetConfigForClient] returning a
-// freshly-built config per inbound connection — that's the
-// canonical Go idiom for hot-reloading ClientCAs without
-// disabling the standard chain verifier.
-type tunnelServerReloader struct {
-	certPath, keyPath, clientCAPath string
-	log                             *slog.Logger
-
-	mu            sync.RWMutex
-	cert          *tls.Certificate
-	certMtime     time.Time
-	clientCAPool  *x509.CertPool
-	clientCAMtime time.Time
-}
-
-func newTunnelServerReloader(certPath, keyPath, clientCAPath string, log *slog.Logger) (*tunnelServerReloader, error) {
-	if log == nil {
-		log = slog.Default()
-	}
-	r := &tunnelServerReloader{certPath: certPath, keyPath: keyPath, clientCAPath: clientCAPath, log: log}
-	if err := r.refreshCert(); err != nil {
-		return nil, err
-	}
-	if err := r.refreshClientCAs(); err != nil {
-		return nil, fmt.Errorf("initial tunnel client CA: %w", err)
-	}
-	return r, nil
-}
-
-func (r *tunnelServerReloader) refreshCert() error {
-	stat, err := os.Stat(r.certPath)
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", r.certPath, err)
-	}
-	r.mu.RLock()
-	prev := r.certMtime
-	loaded := r.cert != nil
-	r.mu.RUnlock()
-	if !stat.ModTime().After(prev) && loaded {
-		return nil
-	}
-	keyPair, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
-	if err != nil {
-		return fmt.Errorf("load tunnel server cert: %w", err)
-	}
-	if len(keyPair.Certificate) > 0 {
-		leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
-		if err != nil {
-			return fmt.Errorf("parse tunnel server leaf %s: %w", r.certPath, err)
-		}
-		keyPair.Leaf = leaf
-	}
-	r.mu.Lock()
-	r.cert = &keyPair
-	r.certMtime = stat.ModTime()
-	r.mu.Unlock()
-	r.log.Info("tunnel server cert reloaded",
-		"path", r.certPath,
-		"mtime", stat.ModTime())
-	return nil
-}
-
-func (r *tunnelServerReloader) refreshClientCAs() error {
-	pool, raw, mtime, err := readPoolIfChanged(r.clientCAPath, r.clientCAMtime, func() bool {
-		r.mu.RLock()
-		defer r.mu.RUnlock()
-		return r.clientCAPool != nil
-	})
-	if err != nil || pool == nil {
-		return err
-	}
-	r.mu.Lock()
-	r.clientCAPool = pool
-	r.clientCAMtime = mtime
-	r.mu.Unlock()
-	r.log.Info("tunnel client CA bundle reloaded",
-		"path", r.clientCAPath,
-		"mtime", mtime,
-		"fingerprint", bundleFingerprint(raw))
-	return nil
-}
-
-// RunPoll ticks every interval and reloads BOTH the server cert
-// and the ClientCAs bundle when their mtimes advance. Returns
-// when ctx is cancelled.
-func (r *tunnelServerReloader) RunPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
-	if interval <= 0 {
-		interval = DefaultCAPollInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := r.refreshCert(); err != nil {
-				log.Warn("tunnel server cert reload failed; keeping previous cert", "path", r.certPath, "err", err)
-			}
-			if err := r.refreshClientCAs(); err != nil {
-				log.Warn("tunnel client CA reload failed; keeping previous pool", "path", r.clientCAPath, "err", err)
-			}
-		}
-	}
-}
-
-// TLSConfig returns the outer *tls.Config the listener installs.
-// GetConfigForClient delivers a freshly-built per-connection config
-// with the latest cert + pool so a rotated ClientCAs file takes
-// effect within one poll interval, without disrupting in-flight
-// connections.
-func (r *tunnelServerReloader) TLSConfig() *tls.Config {
-	return &tls.Config{
-		GetConfigForClient: r.serverConfigForClient,
-		MinVersion:         tls.VersionTLS12,
-	}
-}
-
-func (r *tunnelServerReloader) serverConfigForClient(_ *tls.ClientHelloInfo) (*tls.Config, error) {
-	r.mu.RLock()
-	cert := r.cert
-	pool := r.clientCAPool
-	r.mu.RUnlock()
-	if cert == nil || pool == nil {
-		return nil, errors.New("tunnelServerReloader: TLS material not loaded")
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-// readPoolIfChanged returns (newPool, raw, newMtime, nil) when the
-// file's mtime has advanced past prevMtime OR alreadyLoaded()
-// returns false (the initial-load case). Returns
-// (nil, nil, _, nil) when the file is unchanged — caller treats
-// this as a no-op. raw is the PEM bytes the pool was built from,
-// suitable for fingerprinting in the caller's success log.
-// Shared by both reloaders so the mtime + parse logic stays in
-// one place.
-func readPoolIfChanged(path string, prevMtime time.Time, alreadyLoaded func() bool) (*x509.CertPool, []byte, time.Time, error) {
-	stat, err := os.Stat(path)
-	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("stat %s: %w", path, err)
-	}
-	if !stat.ModTime().After(prevMtime) && alreadyLoaded() {
-		return nil, nil, time.Time{}, nil
-	}
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("read %s: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, nil, time.Time{}, fmt.Errorf("%s contains no PEM certs", path)
-	}
-	return pool, pem, stat.ModTime(), nil
-}
-
-// bundleFingerprint is the first 8 bytes of sha256(pem), hex-
-// encoded. Short enough for human-friendly log diffing across a
-// fleet, long enough that distinct bundles don't collide in
-// practice.
-func bundleFingerprint(pem []byte) string {
-	sum := sha256.Sum256(pem)
-	return hex.EncodeToString(sum[:8])
-}
-
 // loadSSHPrivateKey reads any supported private key file and returns
 // an ssh.Signer. [gossh.ParsePrivateKey] handles OpenSSH-format
 // ("OPENSSH PRIVATE KEY" PEM blocks, the default ssh-keygen writes)
@@ -957,23 +773,6 @@ func loadRecordingSink(log *slog.Logger) (recording.Sink, error) {
 	}
 	log.Info("session recording enabled", "root", sink.Root())
 	return sink, nil
-}
-
-// runPortal serves the admin portal until ctx is cancelled, then
-// gracefully drains in-flight requests. http.ErrServerClosed (the
-// expected result of Shutdown) is folded to nil so it doesn't read as
-// a fatal listener error in the coordination loop.
-func runPortal(ctx context.Context, srv *http.Server) error {
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return nil
 }
 
 // newSessionTracker wraps source in the portal session tracker. A nil

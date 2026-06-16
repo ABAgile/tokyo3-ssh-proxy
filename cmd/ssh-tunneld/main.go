@@ -78,12 +78,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/run"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
@@ -199,37 +199,18 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("host cert renewer: %w", err)
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
-	expected := 2 // dialer + CA-poll
-
-	wg.Go(func() {
-		errCh <- dialer.Run(rootCtx)
-	})
-	wg.Go(func() {
-		errCh <- r.RunPoll(rootCtx, reloader.DefaultPollInterval)
-	})
-
-	if renewer != nil {
-		expected = 3
-		wg.Go(func() {
-			errCh <- renewer.Run(rootCtx)
-		})
+	// Run the dialer, the TLS-reloader poller, and (when enabled) the
+	// host-cert renewer concurrently. run.Group cancels its child context
+	// on the first component exit so the rest wind down cleanly.
+	components := []run.Component{
+		dialer.Run,
+		func(ctx context.Context) error { return r.RunPoll(ctx, reloader.DefaultPollInterval) },
 	}
-
-	// Wait for first component exit; cancel to bring the others down.
-	first := <-errCh
-	cancel()
-	go func() {
-		// Drain remaining errors so the goroutines can finish.
-		for range expected - 1 {
-			<-errCh
-		}
-	}()
-	wg.Wait()
-
-	if first != nil && !errors.Is(first, context.Canceled) {
-		return fmt.Errorf("agent: %w", first)
+	if renewer != nil {
+		components = append(components, renewer.Run)
+	}
+	if err := run.Group(rootCtx, components...); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("agent: %w", err)
 	}
 	log.Info("stopped")
 	return nil
