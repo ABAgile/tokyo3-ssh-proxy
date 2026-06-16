@@ -164,9 +164,8 @@ import (
 
 	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/guard"
 	"github.com/abagile/tokyo3-base/journal"
-	"github.com/abagile/tokyo3-base/journal/jetstream"
-	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/google/uuid"
@@ -243,11 +242,13 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("recording sink: %w", err)
 	}
 
-	auditSink, err := openAuditSink(log)
+	// cli.AuditSink draws NATS material from rt.NATS (SSH_PROXYD_NATS_*
+	// falling back to SSH_PROXYD_WORKLOAD_*); empty URL ⇒ no-op sink.
+	auditSink, err := cli.AuditSink[audit.Entry](rt, audit.Subject)
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
 	}
-	defer envutil.CloseIfCloser(auditSink)
+	defer guard.Close(auditSink)
 
 	// Build the certd-client TLS reloader once when any certd-
 	// touching surface is enabled (per-session minter OR revocation
@@ -329,36 +330,45 @@ func runServe(ctx context.Context) error {
 	var sessionTracker *portal.SessionTracker
 	var auditTracker *portal.AuditTracker
 	if portalAddr := os.Getenv("SSH_PROXYD_PORTAL_ADDR"); portalAddr != "" {
-		sessionSource, err := openSSHAuditSource(log)
-		if err != nil {
-			return fmt.Errorf("portal session source: %w", err)
-		}
-		defer envutil.CloseIfCloser(sessionSource)
-		sessionTracker, err = newSessionTracker(log, sessionSource)
-		if err != nil {
-			return fmt.Errorf("portal session tracker: %w", err)
-		}
-		// A typed-nil tracker must not reach the store interface (a
-		// non-nil interface wrapping a nil pointer would panic on
-		// render) — only assign when the tracker is actually live.
+		// The session list + audit viewer each tail ssh-proxyd's own
+		// ssh_audit stream (the session tracker filters recording.completed;
+		// the audit viewer shows all event types) via two independent
+		// cli.AuditSource readers sharing rt.NATS material — same
+		// SSH_PROXYD_NATS_* → SSH_PROXYD_WORKLOAD_* fallback and per-handshake
+		// hot-reload as the sink. With no NATS configured the trackers stay
+		// nil and the portal renders empty.
 		var sessionStore portal.SessionStore
-		if sessionTracker != nil {
-			sessionStore = sessionTracker
-		}
-		// Separate ssh_audit consumer for the audit viewer (all event
-		// types, vs. the session tracker's recording.completed filter).
-		auditSource, err := openSSHAuditSource(log)
-		if err != nil {
-			return fmt.Errorf("portal audit source: %w", err)
-		}
-		defer envutil.CloseIfCloser(auditSource)
-		auditTracker, err = newAuditTracker(log, auditSource)
-		if err != nil {
-			return fmt.Errorf("portal audit tracker: %w", err)
-		}
 		var auditStore portal.AuditStore
-		if auditTracker != nil {
-			auditStore = auditTracker
+		if rt.NATS.URL == "" {
+			log.Warn("SSH_PROXYD_NATS_URL unset — portal session list + audit viewer will be empty (no ssh_audit stream to tail)")
+		} else {
+			sessionSource, err := cli.AuditSource(rt, audit.StreamName, audit.Subject)
+			if err != nil {
+				return fmt.Errorf("portal session source: %w", err)
+			}
+			defer guard.Close(sessionSource)
+			sessionTracker, err = newSessionTracker(log, sessionSource)
+			if err != nil {
+				return fmt.Errorf("portal session tracker: %w", err)
+			}
+			// A typed-nil tracker must not reach the store interface (a
+			// non-nil interface wrapping a nil pointer would panic on
+			// render) — only assign when the tracker is actually live.
+			if sessionTracker != nil {
+				sessionStore = sessionTracker
+			}
+			auditSource, err := cli.AuditSource(rt, audit.StreamName, audit.Subject)
+			if err != nil {
+				return fmt.Errorf("portal audit source: %w", err)
+			}
+			defer guard.Close(auditSource)
+			auditTracker, err = newAuditTracker(log, auditSource)
+			if err != nil {
+				return fmt.Errorf("portal audit tracker: %w", err)
+			}
+			if auditTracker != nil {
+				auditStore = auditTracker
+			}
 		}
 		castStore, err := loadPortalCastStore(log)
 		if err != nil {
@@ -394,29 +404,29 @@ func runServe(ctx context.Context) error {
 	defer cancel()
 
 	if revocationChecker != nil {
-		go func() {
+		guard.Go(log, "revocation-poller", func() {
 			if err := revocationChecker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("revocation poller exited", "err", err)
 			}
-		}()
+		})
 	}
 
 	// Portal session tracker + audit tracker each subscribe + tail
 	// ssh_audit (sessions filter to recording.completed; audit shows
 	// all event types). Both exit on rootCtx cancel.
 	if sessionTracker != nil {
-		go func() {
+		guard.Go(log, "session-tracker", func() {
 			if err := sessionTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("session tracker exited", "err", err)
 			}
-		}()
+		})
 	}
 	if auditTracker != nil {
-		go func() {
+		guard.Go(log, "audit-tracker", func() {
 			if err := auditTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("audit tracker exited", "err", err)
 			}
-		}()
+		})
 	}
 
 	// CA-bundle mtime pollers — one per reloader. Each polls every
@@ -426,18 +436,18 @@ func runServe(ctx context.Context) error {
 	// rootCtx cancels (typical shutdown) or after a misconfigured
 	// reloader was constructed (caught earlier).
 	if certdReloader != nil {
-		go func() {
+		guard.Go(log, "certd-ca-poller", func() {
 			if err := certdReloader.RunPoll(rootCtx, reloader.DefaultPollInterval); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("certd-client CA poller exited", "err", err)
 			}
-		}()
+		})
 	}
 	if tunnelReloader != nil {
-		go func() {
+		guard.Go(log, "tunnel-ca-poller", func() {
 			if err := tunnelReloader.RunPoll(rootCtx, DefaultCAPollInterval, log); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("tunnel client CA poller exited", "err", err)
 			}
-		}()
+		})
 	}
 
 	// Run the tunnel listener alongside the SSH server when one is
@@ -931,22 +941,6 @@ func loadSSHPrivateKey(path string) (gossh.Signer, error) {
 	return signer, nil
 }
 
-// openAuditSink builds the JetStream publisher Sink from
-// SSH_PROXYD_NATS_URL + the CERT/KEY/CA env vars. When the URL is
-// empty, returns [audit.NoopSink] — keeps the dev / no-NATS path
-// working without a broker.
-func openAuditSink(log *slog.Logger) (audit.Sink, error) {
-	return jetstream.NewAuditSink[audit.Entry](jetstream.AuditSinkConfig{
-		URL:       os.Getenv("SSH_PROXYD_NATS_URL"),
-		CertFile:  os.Getenv("SSH_PROXYD_NATS_CERT"),
-		KeyFile:   os.Getenv("SSH_PROXYD_NATS_KEY"),
-		CAFile:    envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
-		Subject:   audit.Subject,
-		EnvPrefix: "SSH_PROXYD_NATS",
-		Log:       log,
-	})
-}
-
 // loadRecordingSink returns the asciinema cast sink. When
 // SSH_PROXYD_CAST_DIR is set, recordings drop into that directory
 // via [recording.LocalDirSink]. Unset disables recording with a
@@ -980,44 +974,6 @@ func runPortal(ctx context.Context, srv *http.Server) error {
 		return err
 	}
 	return nil
-}
-
-// openSSHAuditSource builds a JetStream source on ssh-proxyd's own
-// ssh_audit stream — the portal's session tracker and audit viewer
-// each open one. Reuses the SSH_PROXYD_NATS_* connection material the
-// audit publisher already uses. Returns (nil, nil) when no NATS URL is
-// configured, so the portal still serves (with empty session + audit
-// lists) without a broker.
-func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
-	url := os.Getenv("SSH_PROXYD_NATS_URL")
-	if url == "" {
-		log.Warn("SSH_PROXYD_NATS_URL unset — portal session list + audit viewer will be empty (no ssh_audit stream to tail)")
-		return nil, nil
-	}
-	var tlsCfg *tls.Config
-	if cert := os.Getenv("SSH_PROXYD_NATS_CERT"); cert != "" {
-		cfg, err := btls.FromFiles(
-			cert,
-			os.Getenv("SSH_PROXYD_NATS_KEY"),
-			envutil.First("SSH_PROXYD_NATS_CA", "SSH_PROXYD_WORKLOAD_CA"),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("ssh-audit source TLS: %w", err)
-		}
-		tlsCfg = cfg
-	}
-	source, err := jetstream.NewSource(jetstream.SourceConfig{
-		URL:        url,
-		StreamName: audit.StreamName,
-		Subject:    audit.Subject,
-		TLS:        tlsCfg,
-		Log:        log,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("ssh-audit source: %w", err)
-	}
-	log.Info("portal ssh-audit source configured", "url", url)
-	return source, nil
 }
 
 // newSessionTracker wraps source in the portal session tracker. A nil

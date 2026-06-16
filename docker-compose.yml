@@ -61,7 +61,6 @@
 #     docker compose logs -f ssh-proxyd ssh-tunneld
 #     docker compose exec natsbox nats stream view ssh_audit
 #     docker compose exec natsbox nats stream view ca_audit
-#     # NATS_PORT=14222 make docker-up                 # override host NATS port
 #     curl -u admin:devportal http://localhost:8090/sessions
 #                                     # ssh-proxyd admin portal: recorded
 #                                     # sessions + asciinema replay (open in a
@@ -76,14 +75,12 @@
 services:
 
   # ── NATS JetStream broker ────────────────────────────────────────────────────
-  # NATS_PORT defaults to 4222 (in-network port). Override for the
-  # host side when 4222 is taken:
-  #     NATS_PORT=14222 make docker-up
+  # In-network only (nats:4222); not published to the host.
   nats:
     image: nats:2.10-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
-    ports:
-      - "${NATS_PORT:-4222}:4222"
+    # No host port: reachable only on the compose network as nats:4222
+    # (the daemons connect in-network; use natsbox for interactive access).
     volumes:
       - nats-data:/data
     healthcheck:

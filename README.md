@@ -103,7 +103,6 @@ ssh -i ./shared/certs/user -p 2222 demo@localhost
 docker compose logs -f ssh-proxyd ssh-tunneld
 docker compose exec natsbox nats stream view ssh_audit
 open http://localhost:8090/sessions             # admin portal (Basic auth admin:devportal)
-NATS_PORT=14222 make docker-up                  # override host NATS port if 4222 is taken
 make docker-down                                # stop (preserves volumes)
 make clean-all                                  # full reset
 ```
