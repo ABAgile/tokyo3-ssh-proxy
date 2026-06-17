@@ -1,10 +1,8 @@
 package portal
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -53,20 +51,15 @@ type Session struct {
 
 // SessionTracker subscribes to a [journal.Source] (a JetStream tail
 // of ssh-proxyd's own ssh_audit stream) and maintains a bounded ring
-// of the most-recent recording.completed events. The tracker is the
-// [SessionStore] the /sessions page renders from.
+// of the most-recent recording.completed events. It wraps a
+// [journal.Tracker]; the tracker is the [SessionStore] the /sessions
+// page renders from.
 //
-// The subscriber goroutine is owned by [SessionTracker.Run] — call
-// it once after construction; cancel ctx to stop. Concurrent reads
-// via [Sessions] are safe.
+// The subscriber goroutine is owned by the embedded Run — call it once
+// after construction; cancel ctx to stop. Concurrent reads via
+// [Sessions] are safe.
 type SessionTracker struct {
-	src     journal.Source
-	max     int
-	log     *slog.Logger
-	subject string // informational only; for log lines
-
-	mu       sync.RWMutex
-	sessions []Session // newest first
+	*journal.Tracker[Session]
 }
 
 // SessionTrackerConfig wires a tracker.
@@ -91,70 +84,11 @@ type SessionTrackerConfig struct {
 // surfaces the latest activity rather than the full history.
 const DefaultMaxSessions = 200
 
-// NewSessionTracker validates cfg and returns a tracker. Source is
-// the only hard requirement.
-func NewSessionTracker(cfg SessionTrackerConfig) (*SessionTracker, error) {
-	if cfg.Source == nil {
-		return nil, errSessionSourceRequired
-	}
-	if cfg.MaxSessions <= 0 {
-		cfg.MaxSessions = DefaultMaxSessions
-	}
-	if cfg.Log == nil {
-		cfg.Log = slog.Default()
-	}
-	return &SessionTracker{
-		src:     cfg.Source,
-		max:     cfg.MaxSessions,
-		log:     cfg.Log,
-		subject: cfg.SubjectLabel,
-	}, nil
-}
-
-// Run subscribes to the journal source, decodes each inbound payload
-// as a recording.completed event, and appends to the in-memory ring.
-// Returns when ctx is cancelled or the source's channel closes. The
-// tracker tolerates malformed payloads and non-recording-completed
-// events — they're skipped silently (logged at debug) rather than
-// crashing the loop.
-func (t *SessionTracker) Run(ctx context.Context) error {
-	// Backfill the latest MaxSessions records, then tail. Persistent
-	// JetStream streams retain history far longer than the in-memory
-	// cap, so this hydrates the page with whatever was published
-	// before ssh-proxyd started.
-	ch, err := t.src.Subscribe(ctx, t.max, 0)
-	if err != nil {
-		return err
-	}
-	t.log.Info("session tracker subscribed", "subject", t.subject, "replay", t.max)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case msg, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			t.ingest(msg)
-		}
-	}
-}
-
-// Sessions returns a copy of the current recent-sessions ring,
-// newest first. Safe to call from request handlers while [Run] is
-// active.
-func (t *SessionTracker) Sessions() []Session {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	out := make([]Session, len(t.sessions))
-	copy(out, t.sessions)
-	return out
-}
-
-// ingest decodes one journal message, filters to
-// recording.completed, and prepends to the ring (newest first).
-// Buffer is trimmed to MaxSessions after each append.
-func (t *SessionTracker) ingest(msg journal.Msg) {
+// decodeSession decodes one journal message, filters to
+// recording.completed, and parses duration_seconds out of the
+// Metadata blob. Returns ok=false on a JSON failure or any action
+// other than recording.completed.
+func decodeSession(msg journal.Msg) (Session, bool) {
 	var raw struct {
 		Action        string    `json:"action"`
 		SessionID     string    `json:"session_id"`
@@ -168,11 +102,10 @@ func (t *SessionTracker) ingest(msg journal.Msg) {
 		OccurredAt    time.Time `json:"occurred_at"`
 	}
 	if err := json.Unmarshal(msg.Data, &raw); err != nil {
-		t.log.Debug("session tracker: decode failed", "err", err, "seq", msg.Seq)
-		return
+		return Session{}, false
 	}
 	if raw.Action != audit.ActionRecordingComplete {
-		return // not a session-list event
+		return Session{}, false // not a session-list event
 	}
 	sess := Session{
 		SessionID:     raw.SessionID,
@@ -192,22 +125,32 @@ func (t *SessionTracker) ingest(msg journal.Msg) {
 			sess.Duration = time.Duration(md.DurationSeconds * float64(time.Second))
 		}
 	}
-
-	t.mu.Lock()
-	// Newest first; prepend by shifting. For the small N here (~200)
-	// a simple slice prepend is cheap and avoids ring-buffer
-	// bookkeeping.
-	t.sessions = append([]Session{sess}, t.sessions...)
-	if len(t.sessions) > t.max {
-		t.sessions = t.sessions[:t.max]
-	}
-	t.mu.Unlock()
+	return sess, true
 }
 
-// errSessionSourceRequired keeps NewSessionTracker's error stable
-// across go vet's recommendations about exported errors.
-var errSessionSourceRequired = sessionTrackerErr("source is required")
+// NewSessionTracker validates cfg and returns a tracker. Source is
+// the only hard requirement.
+func NewSessionTracker(cfg SessionTrackerConfig) (*SessionTracker, error) {
+	if cfg.MaxSessions <= 0 {
+		cfg.MaxSessions = DefaultMaxSessions
+	}
+	t, err := journal.NewTracker(journal.TrackerConfig[Session]{
+		Source: cfg.Source,
+		Max:    cfg.MaxSessions,
+		Log:    cfg.Log,
+		Label:  "ssh_audit/sessions",
+		Decode: decodeSession,
+		// Less nil ⇒ arrival-order prepend: the ssh_audit stream
+		// publishes recording.completed events in completion order, so
+		// arrival order already matches recency.
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &SessionTracker{t}, nil
+}
 
-type sessionTrackerErr string
-
-func (e sessionTrackerErr) Error() string { return string(e) }
+// Sessions returns a copy of the current recent-sessions ring,
+// newest first. Safe to call from request handlers while Run is
+// active. Satisfies [SessionStore].
+func (t *SessionTracker) Sessions() []Session { return t.Snapshot() }
